@@ -1,0 +1,7 @@
+fn vue_recherche(titre: Text) -> Text {
+    var _o = ""
+    _o += "<!doctype html><html lang=\"fr\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>"
+    _o += html_escape(titre)
+    _o += " — Recherche</title><link rel=\"stylesheet\" href=\"/static/nolcore.css\"></head><body><main class=\"page wide\"><section class=\"card\"><h1>Recherche NolCore</h1><form action=\"/recherche\"><input name=\"q\" placeholder=\"Rechercher dans vos sources\" autofocus><button>Rechercher</button></form><p>Index PostgreSQL, crawler respectueux des robots.txt et résultats classés.</p></section></main></body></html>\n"
+    return _o
+}

@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: nolcore
+      POSTGRES_USER: nolcore
+      POSTGRES_PASSWORD: nolcore_dev_only
+    volumes: ["nolcore_pg:/var/lib/postgresql/data", "./schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro"]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U nolcore -d nolcore"], interval: 5s, timeout: 5s, retries: 10}
+  app:
+    build: .
+    environment:
+      NOLIAE_BIND: 0.0.0.0
+      NOLIAE_PORT: 8080
+      NOLIAE_SESSION_SECRET: ${NOLIAE_SESSION_SECRET:-dev-secret-change-me-please-32chars}
+      NOLCORE_DATABASE_URL: postgres://nolcore:nolcore_dev_only@postgres:5432/nolcore
+      NOLCORE_CLAUDE_URL: ${NOLCORE_CLAUDE_URL:-}
+      NOLCORE_CLAUDE_TOKEN: ${NOLCORE_CLAUDE_TOKEN:-}
+      NOLCORE_CHATGPT_URL: ${NOLCORE_CHATGPT_URL:-}
+      NOLCORE_CHATGPT_TOKEN: ${NOLCORE_CHATGPT_TOKEN:-}
+      NOLCORE_MISTRAL_URL: ${NOLCORE_MISTRAL_URL:-}
+      NOLCORE_MISTRAL_TOKEN: ${NOLCORE_MISTRAL_TOKEN:-}
+      NOLCORE_GEMINI_URL: ${NOLCORE_GEMINI_URL:-}
+      NOLCORE_GEMINI_TOKEN: ${NOLCORE_GEMINI_TOKEN:-}
+      NOLCORE_DISCORD_BOT_TOKEN: ${NOLCORE_DISCORD_BOT_TOKEN:-}
+      NOLCORE_DISCORD_GUILD_ID: ${NOLCORE_DISCORD_GUILD_ID:-}
+      NOLCORE_DISCORD_WEBHOOK_URL: ${NOLCORE_DISCORD_WEBHOOK_URL:-}
+    ports: ["8080:8080"]
+    depends_on: {postgres: {condition: service_healthy}}
+volumes: {nolcore_pg:}

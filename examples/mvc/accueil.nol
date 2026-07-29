@@ -1,0 +1,11 @@
+fn vue_accueil(titre: Text, runtime: Text) -> Text {
+    var _o = ""
+    _o += "<!doctype html><html lang=\"fr\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>"
+    _o += html_escape(titre)
+    _o += "</title><style>body{font-family:system-ui;background:#10131a;color:#eef;max-width:900px;margin:10vh auto;padding:24px}section{background:#191e29;padding:24px;border-radius:16px}li{margin:12px 0}</style></head><body><section><h1>"
+    _o += html_escape(titre)
+    _o += "</h1><p>Core applicatif unifié — "
+    _o += html_escape(runtime)
+    _o += "</p><ul><li>Users &amp; Auth</li><li>Interface IA</li><li>Recherche PostgreSQL</li><li>API / Services</li><li>Permissions</li><li>Administration</li></ul><p><a href=\"/api/health\">État du service</a> · <a href=\"/api/capacites\">Capacités API</a></p></section></body></html>\n"
+    return _o
+}

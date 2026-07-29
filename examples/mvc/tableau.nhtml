@@ -1,0 +1,2 @@
+@model(titre: Text)
+<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>@titre — Tableau de bord</title><link rel="stylesheet" href="/static/nolcore.css"></head><body><main class="page wide"><section class="card"><h1>Tableau de bord</h1><div class="grid"><article>Users &amp; Auth</article><article>Interface IA</article><article>Recherche</article><article>Administration</article></div></section></main></body></html>

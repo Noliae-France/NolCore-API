@@ -1,0 +1,5 @@
+.env
+*.secret
+nolcore
+target/
+.DS_Store

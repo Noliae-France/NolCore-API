@@ -1,0 +1,7 @@
+fn vue_inscription(titre: Text) -> Text {
+    var _o = ""
+    _o += "<!doctype html><html lang=\"fr\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>"
+    _o += html_escape(titre)
+    _o += " — Inscription</title><link rel=\"stylesheet\" href=\"/static/nolcore.css\"></head><body><main class=\"page\"><section class=\"card\"><h1>Créer un compte</h1><form method=\"post\" action=\"/v1/auth/register\"><label>Nom<input name=\"name\" required></label><label>Email<input type=\"email\" name=\"email\" required></label><label>Mot de passe<input type=\"password\" name=\"password\" minlength=\"8\" required></label><button>S’inscrire</button></form><a href=\"/connexion\">J’ai déjà un compte</a></section></main></body></html>\n"
+    return _o
+}

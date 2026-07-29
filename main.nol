@@ -1,0 +1,608 @@
+import "../nolc/lib/web.nol"
+import "../nolc/lib/pg.nol"
+import "../nolc/lib/json.nol"
+import "../nolc/lib/sodium.nol"
+import "../nolc/lib/temps.nol"
+import "crawler.nol"
+import "../nolc/lib/http_client.nol"
+import "smtp.nol"
+
+fn db() -> Option<Ptr<PgConn>> { return pg_ouvrir(unwrap_or(env("NOLCORE_DATABASE_URL"), "")) }
+
+fn ip_requete(req: Requete) -> Text { return unwrap_or(requete_entete(req, "X-Forwarded-For"), "unknown") }
+
+fn cookie_session(secret: Text, email: Text, ip: Text) -> Option<Text> {
+    let nonce = random_hex(32)
+    if not has(nonce) { return none }
+    let ts = text(maintenant_epoch())
+    let brut = email + "|" + ts + "|" + unwrap_or(nonce, "")
+    let signature = hmac_sha256_hex(bytes_from_text(secret), bytes_from_text(brut + "|" + ip))
+    return some(brut + "|" + signature)
+}
+
+fn erreur_json(code: Int, titre: Text, detail: Text, req: Requete) -> WebResultat {
+    return WebResultat.WebEchec(erreur_http(code, titre, detail, requete_id(req)))
+}
+
+fn champ_entree(req: Requete, nom: Text) -> Option<Text> {
+    let json = requete_json(req)
+    if has(json) { return json_texte_champ(unwrap_or(json, ""), nom) }
+    return requete_form(req, nom)
+}
+
+fn utilisateur(req: Requete, secret: Text) -> Option<Text> {
+    let token = requete_bearer(req)
+    if has(token) {
+        let session = session_verifie(secret, unwrap_or(token, ""), maintenant_epoch())
+        if has(session) { return some(unwrap_or(session, SessionSigne { sujet: "", expiration: 0, nonce: "" }).sujet) }
+    }
+    let cookie = requete_cookie(req, "nol_session")
+    if not has(cookie) { return none }
+    let morceaux = split(unwrap_or(cookie, ""), "|")
+    if len(morceaux) != 4 { return none }
+    let email = get(morceaux,0)
+    let ts = get(morceaux,1)
+    let nonce = get(morceaux,2)
+    let signature = get(morceaux,3)
+    let attendu = hmac_sha256_hex(bytes_from_text(secret), bytes_from_text(email + "|" + ts + "|" + nonce + "|" + ip_requete(req)))
+    if not bytes_egal_ct(unwrap_or(hex_decode(attendu),bytes_new()), unwrap_or(hex_decode(signature),bytes_new())) { return none }
+    let conn = db()
+    if not has(conn) { return none }
+    let hash = hmac_sha256_hex(bytes_from_text(secret), bytes_from_text(unwrap_or(cookie,"")))
+    let res = pg_requete_params(unwrap_or(conn,ptr_null()), "SELECT s.user_id FROM user_sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.email=$2 AND u.email=$2 AND s.ip=$3 AND s.revoked=false AND s.expires_at > now()", [hash,email,ip_requete(req)])
+    if not has(res) { pg_fermer(unwrap_or(conn,ptr_null())); return none }
+    let sortie = unwrap_or(res,ptr_null())
+    if pg_lignes(sortie) != 1 { pg_liberer(sortie); pg_fermer(unwrap_or(conn,ptr_null())); return none }
+    let id = pg_valeur(sortie,0,0)
+    pg_liberer(sortie); pg_fermer(unwrap_or(conn,ptr_null()))
+    return id
+}
+
+fn api_sante(_req: Requete, _params: Map<Text>) -> WebResultat {
+    return WebResultat.WebOk(reponse_json("{\"status\":\"ok\",\"runtime\":\"nolc\",\"service\":\"nolcore\"}"))
+}
+
+fn api_pret(_req: Requete, _params: Map<Text>) -> WebResultat {
+    let conn = db()
+    if not has(conn) { return erreur_json(503,"Service Unavailable","PostgreSQL indisponible.",_req) }
+    let res = pg_requete(unwrap_or(conn,ptr_null()), "SELECT 1")
+    if has(res) { pg_liberer(unwrap_or(res,ptr_null())) }
+    pg_fermer(unwrap_or(conn,ptr_null()))
+    if not has(res) { return erreur_json(503,"Service Unavailable","PostgreSQL indisponible.",_req) }
+    return WebResultat.WebOk(reponse_json("{\"status\":\"ready\",\"database\":\"ok\"}"))
+}
+
+fn api_capacites(_req: Requete, _params: Map<Text>) -> WebResultat {
+    return WebResultat.WebOk(reponse_json("{\"modules\":[\"users\",\"auth\",\"ia\",\"recherche\",\"postgresql\",\"permissions\",\"administration\"]}"))
+}
+
+fn api_register(req: Requete, _params: Map<Text>) -> WebResultat {
+    let email = champ_entree(req, "email")
+    let nom = champ_entree(req, "name")
+    let mot = champ_entree(req, "password")
+    if not has(email) or not has(nom) or not has(mot) { return erreur_json(422, "Unprocessable Content", "email, name et password sont obligatoires.", req) }
+    let secret = bytes_from_text(unwrap_or(mot, ""))
+    let hash = mot_de_passe_hache(secret)
+    if not has(hash) { return erreur_json(500, "Internal Server Error", "Hachage indisponible.", req) }
+    let conn = db()
+    if not has(conn) { return erreur_json(503, "Service Unavailable", "Base PostgreSQL indisponible.", req) }
+    let res = pg_requete_params(unwrap_or(conn, ptr_null()), "INSERT INTO users(email,display_name,password_hash) VALUES($1,$2,$3) RETURNING id,email,display_name,role", [unwrap_or(email, ""), unwrap_or(nom, ""), unwrap_or(hash, "")])
+    if not has(res) { pg_fermer(unwrap_or(conn, ptr_null())); return erreur_json(409, "Conflict", "Email déjà utilisé.", req) }
+    let sortie = unwrap_or(res, ptr_null())
+    let id = unwrap_or(pg_valeur(sortie, 0, 0), "")
+    let token = random_hex(32)
+    if not has(token) { pg_liberer(sortie); pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(500,"Internal Server Error","Token de vérification indisponible.",req) }
+    let token_hash = hmac_sha256_hex(bytes_from_text(unwrap_or(env("NOLIAE_SESSION_SECRET"),"")), bytes_from_text(unwrap_or(token,"")))
+    let saved_token = pg_requete_params(unwrap_or(conn,ptr_null()), "INSERT INTO email_verification_tokens(token_hash,user_id,expires_at) VALUES($1,$2,now()+interval '24 hours')", [token_hash,id])
+    if has(saved_token) { pg_liberer(unwrap_or(saved_token,ptr_null())) }
+    let smtp_id = unwrap_or(env("NOLCORE_VERIFICATION_SMTP_ID"),"")
+    if smtp_id != "" {
+        let profile = pg_requete_params(unwrap_or(conn,ptr_null()), "SELECT host,port,username,secret_env FROM smtp_profiles WHERE id=$1 AND enabled=true", [smtp_id])
+        if not has(profile) or pg_lignes(unwrap_or(profile,ptr_null())) != 1 { if has(profile) { pg_liberer(unwrap_or(profile,ptr_null())) }; pg_liberer(sortie); pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(503,"Service Unavailable","SMTP de vérification indisponible.",req) }
+        let p = unwrap_or(profile,ptr_null())
+        let host = unwrap_or(pg_valeur(p,0,0),"")
+        let port = unwrap_or(parse_int(unwrap_or(pg_valeur(p,0,1),"465")),465)
+        let username = unwrap_or(pg_valeur(p,0,2),"")
+        let password = unwrap_or(env(unwrap_or(pg_valeur(p,0,3),"")),"")
+        let from = unwrap_or(env("NOLCORE_VERIFICATION_FROM"),username)
+        let url = unwrap_or(env("NOLCORE_PUBLIC_URL"),"http://localhost:8080") + "/v1/user/verify?token=" + unwrap_or(token,"")
+        let delivered = smtp_envoyer(host,port,username,password,from,unwrap_or(email,""),"Vérifiez votre compte Noliae","Cliquez ici pour vérifier votre compte : " + url)
+        pg_liberer(p)
+        if not delivered { pg_liberer(sortie); pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(502,"Bad Gateway","Envoi du mail de vérification impossible.",req) }
+    }
+    let payload = "{\"id\":" + json_texte(id) + ",\"email\":" + json_texte(unwrap_or(email, "")) + ",\"name\":" + json_texte(unwrap_or(nom, "")) + "}"
+    pg_liberer(sortie); pg_fermer(unwrap_or(conn, ptr_null()))
+    return WebResultat.WebOk(reponse_json(payload))
+}
+
+fn api_verify_email(req: Requete, _params: Map<Text>) -> WebResultat {
+    var token = champ_entree(req,"token")
+    if not has(token) { let query = requete_query(req,"token"); if has(query) { token = query } }
+    if not has(token) { return erreur_json(422,"Unprocessable Content","token obligatoire.",req) }
+    let hash = hmac_sha256_hex(bytes_from_text(unwrap_or(env("NOLIAE_SESSION_SECRET"),"")), bytes_from_text(unwrap_or(token,"")))
+    let conn = db()
+    if not has(conn) { return erreur_json(503,"Service Unavailable","Base PostgreSQL indisponible.",req) }
+    let res = pg_requete_params(unwrap_or(conn,ptr_null()), "UPDATE users SET email_verified=true WHERE id=(SELECT user_id FROM email_verification_tokens WHERE token_hash=$1 AND used_at IS NULL AND expires_at>now()) RETURNING id", [hash])
+    if has(res) and pg_lignes(unwrap_or(res,ptr_null())) == 1 {
+        let done = pg_requete_params(unwrap_or(conn,ptr_null()), "UPDATE email_verification_tokens SET used_at=now() WHERE token_hash=$1", [hash])
+        if has(done) { pg_liberer(unwrap_or(done,ptr_null())) }
+        pg_liberer(unwrap_or(res,ptr_null())); pg_fermer(unwrap_or(conn,ptr_null())); return WebResultat.WebOk(reponse_json("{\"verified\":true}"))
+    }
+    if has(res) { pg_liberer(unwrap_or(res,ptr_null())) }; pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(400,"Bad Request","Token invalide ou expiré.",req)
+}
+
+fn api_chat(req: Requete, _params: Map<Text>) -> WebResultat {
+    let secret = unwrap_or(env("NOLIAE_SESSION_SECRET"), "")
+    let id = utilisateur(req, secret)
+    if not has(id) { return erreur_json(401, "Unauthorized", "Bearer Nolc requis.", req) }
+    let corps = requete_json(req)
+    if not has(corps) { return erreur_json(400, "Bad Request", "JSON invalide.", req) }
+    let message = json_texte_champ(unwrap_or(corps, ""), "message")
+    if not has(message) { return erreur_json(422, "Unprocessable Content", "message est obligatoire.", req) }
+    let conn = db()
+    if not has(conn) { return erreur_json(503, "Service Unavailable", "Base PostgreSQL indisponible.", req) }
+    var titre = unwrap_or(message, "")
+    if len(titre) > 80 { titre = sub(titre, 0, 80) }
+    let conversation = pg_requete_params(unwrap_or(conn, ptr_null()), "INSERT INTO conversations(user_id,title) VALUES($1,$2) RETURNING id", [unwrap_or(id,""), titre])
+    if not has(conversation) { pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(500,"Internal Server Error","Création de conversation impossible.",req) }
+    let conv = unwrap_or(conversation, ptr_null())
+    let conv_id = unwrap_or(pg_valeur(conv,0,0),"")
+    pg_liberer(conv)
+    let saved = pg_requete_params(unwrap_or(conn, ptr_null()), "INSERT INTO messages(conversation_id,role,content) VALUES($1,'user',$2)", [conv_id, unwrap_or(message,"")])
+    if has(saved) { pg_liberer(unwrap_or(saved,ptr_null())) }
+    let fournisseur = unwrap_or(env("NOLCORE_DEFAULT_PROVIDER"), "chatgpt")
+    let modele = unwrap_or(env("NOLCORE_DEFAULT_MODEL"), "gpt-4o-mini")
+    let prefix = "NOLCORE_" + upper(fournisseur)
+    let token = unwrap_or(env(prefix + "_TOKEN"), "")
+    var url = unwrap_or(env(prefix + "_URL"), "")
+    if url == "" and (fournisseur == "chatgpt" or fournisseur == "openai") { url = "https://api.openai.com/v1/chat/completions" }
+    if url == "" and fournisseur == "claude" { url = "https://api.anthropic.com/v1/messages" }
+    if url == "" and fournisseur == "mistral" { url = "https://api.mistral.ai/v1/chat/completions" }
+    if url == "" and fournisseur == "gemini" { url = "https://generativelanguage.googleapis.com/v1beta/models/" + modele + ":generateContent?key=" + token }
+    if token == "" { pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(503,"Service Unavailable","Aucun token IA configuré.",req) }
+    let ia = http_post_token(url, "application/json", "{\"model\":" + json_texte(modele) + ",\"messages\":[{\"role\":\"user\",\"content\":" + json_texte(unwrap_or(message,"")) + "}]}", token)
+    if not has(ia) or unwrap_or(ia,ReponseHttp { statut:0,entetes:"",corps:"" }).statut >= 300 { pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(502,"Bad Gateway","Le fournisseur IA est indisponible.",req) }
+    let answer = unwrap_or(ia,ReponseHttp { statut:0,entetes:"",corps:"" }).corps
+    let saved_answer = pg_requete_params(unwrap_or(conn, ptr_null()), "INSERT INTO messages(conversation_id,role,content) VALUES($1,'assistant',$2)", [conv_id, answer])
+    if has(saved_answer) { pg_liberer(unwrap_or(saved_answer,ptr_null())) }
+    pg_fermer(unwrap_or(conn, ptr_null()))
+    return WebResultat.WebOk(reponse_json("{\"conversation_id\":" + json_texte(conv_id) + ",\"answer\":" + json_texte(answer) + "}"))
+}
+
+fn api_login(req: Requete, _params: Map<Text>) -> WebResultat {
+    let email = champ_entree(req, "email")
+    let mot = champ_entree(req, "password")
+    if not has(email) or not has(mot) { return erreur_json(422, "Unprocessable Content", "email et password sont obligatoires.", req) }
+    let conn = db()
+    if not has(conn) { return erreur_json(503, "Service Unavailable", "Base PostgreSQL indisponible.", req) }
+    let res = pg_requete_params(unwrap_or(conn, ptr_null()), "SELECT id,email,display_name,password_hash,role,email_verified FROM users WHERE email=$1", [unwrap_or(email, "")])
+    if not has(res) { pg_fermer(unwrap_or(conn, ptr_null())); return erreur_json(401, "Unauthorized", "Identifiants invalides.", req) }
+    let sortie = unwrap_or(res, ptr_null())
+    if pg_lignes(sortie) != 1 { pg_liberer(sortie); pg_fermer(unwrap_or(conn, ptr_null())); return erreur_json(401, "Unauthorized", "Identifiants invalides.", req) }
+    let hash = unwrap_or(pg_valeur(sortie, 0, 3), "")
+    let valide = mot_de_passe_verifie(hash, bytes_from_text(unwrap_or(mot, "")))
+    if not valide { pg_liberer(sortie); pg_fermer(unwrap_or(conn, ptr_null())); return erreur_json(401, "Unauthorized", "Identifiants invalides.", req) }
+    let verifie = unwrap_or(pg_valeur(sortie,0,5),"false")
+    if verifie != "true" and verifie != "t" { pg_liberer(sortie); pg_fermer(unwrap_or(conn, ptr_null())); return erreur_json(403,"Forbidden","Adresse e-mail non vérifiée.",req) }
+    let id = unwrap_or(pg_valeur(sortie, 0, 0), "")
+    let token = session_signe(unwrap_or(env("NOLIAE_SESSION_SECRET"), ""), id, 86400, maintenant_epoch())
+    let cookie = cookie_session(unwrap_or(env("NOLIAE_SESSION_SECRET"), ""), unwrap_or(email,""), ip_requete(req))
+    if has(cookie) {
+        let cookie_hash = hmac_sha256_hex(bytes_from_text(unwrap_or(env("NOLIAE_SESSION_SECRET"), "")), bytes_from_text(unwrap_or(cookie,"")))
+        let session_id = random_hex(16)
+        if has(session_id) {
+            let saved_session = pg_requete_params(unwrap_or(conn,ptr_null()), "INSERT INTO user_sessions(session_id,token_hash,user_id,email,ip,expires_at) VALUES($1,$2,$3,$4,$5,now()+interval '24 hours')", [unwrap_or(session_id,""),cookie_hash,id,unwrap_or(email,""),ip_requete(req)])
+            if has(saved_session) { pg_liberer(unwrap_or(saved_session,ptr_null())) }
+        }
+    }
+    pg_liberer(sortie); pg_fermer(unwrap_or(conn, ptr_null()))
+    if not has(token) { return erreur_json(500, "Internal Server Error", "Session indisponible.", req) }
+    var rep = reponse_json("{\"token\":" + json_texte(unwrap_or(token, "")) + ",\"user_id\":" + json_texte(id) + "}")
+    if has(cookie) { rep = reponse_cookie(rep, "nol_session", unwrap_or(cookie,""), 86400, true, lower(unwrap_or(env("NOLIAE_COOKIE_SECURE"),"false")) == "true", "Lax") }
+    return WebResultat.WebOk(rep)
+}
+
+fn api_search(req: Requete, _params: Map<Text>) -> WebResultat {
+    let secret = unwrap_or(env("NOLIAE_SESSION_SECRET"), "")
+    let id = utilisateur(req, secret)
+    if not has(id) { return erreur_json(401, "Unauthorized", "Authentification requise.", req) }
+    let q = requete_query(req, "q")
+    if not has(q) or len(unwrap_or(q, "")) < 2 { return erreur_json(422, "Unprocessable Content", "q doit contenir au moins 2 caractères.", req) }
+    let conn = db()
+    if not has(conn) { return erreur_json(503, "Service Unavailable", "Base PostgreSQL indisponible.", req) }
+    let cle_rate = unwrap_or(requete_entete(req, "X-Forwarded-For"), "anonymous")
+    let rate = pg_requete_params(unwrap_or(conn, ptr_null()), "SELECT count(*) FROM audit_logs WHERE action='search' AND metadata->>'key'=$1 AND created_at > now() - interval '1 minute'", [cle_rate])
+    if has(rate) and unwrap_or(parse_int(unwrap_or(pg_valeur(unwrap_or(rate,ptr_null()),0,0),"0")),0) >= 60 { pg_liberer(unwrap_or(rate,ptr_null())); pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(429,"Too Many Requests","Limite de recherche atteinte, réessayez dans une minute.",req) }
+    if has(rate) { pg_liberer(unwrap_or(rate,ptr_null())) }
+    let res = pg_requete_params(unwrap_or(conn, ptr_null()), "SELECT id,title,content FROM documents WHERE owner_id=$1 AND search_vector @@ plainto_tsquery('french',$2) ORDER BY ts_rank(search_vector, plainto_tsquery('french',$2)) DESC LIMIT 30", [unwrap_or(id, ""), unwrap_or(q, "")])
+    if not has(res) { pg_fermer(unwrap_or(conn, ptr_null())); return erreur_json(500, "Internal Server Error", "Recherche indisponible.", req) }
+    let sortie = unwrap_or(res, ptr_null())
+    var items = "["
+    var i = 0
+    while i < pg_lignes(sortie) {
+        if i > 0 { items = items + "," }
+        items = items + "{\"id\":" + json_texte(unwrap_or(pg_valeur(sortie, i, 0), "")) + ",\"title\":" + json_texte(unwrap_or(pg_valeur(sortie, i, 1), "")) + ",\"content\":" + json_texte(unwrap_or(pg_valeur(sortie, i, 2), "")) + "}"
+        i = i + 1
+    }
+    items = items + "]"
+    let _audit = pg_requete_params(unwrap_or(conn, ptr_null()), "INSERT INTO audit_logs(user_id,action,resource,metadata) VALUES($1,'search','documents',jsonb_build_object('key',$2))", [unwrap_or(id,""), cle_rate])
+    if has(_audit) { pg_liberer(unwrap_or(_audit,ptr_null())) }
+    pg_liberer(sortie); pg_fermer(unwrap_or(conn, ptr_null()))
+    return WebResultat.WebOk(reponse_json(items))
+}
+
+fn api_me(req: Requete, _params: Map<Text>) -> WebResultat {
+    let id = utilisateur(req, unwrap_or(env("NOLIAE_SESSION_SECRET"), ""))
+    if not has(id) { return erreur_json(401, "Unauthorized", "Authentification requise.", req) }
+    let conn = db()
+    if not has(conn) { return erreur_json(503, "Service Unavailable", "Base PostgreSQL indisponible.", req) }
+    let res = pg_requete_params(unwrap_or(conn, ptr_null()), "SELECT id,email,display_name,role,created_at FROM users WHERE id=$1", [unwrap_or(id, "")])
+    if not has(res) { pg_fermer(unwrap_or(conn, ptr_null())); return erreur_json(404, "Not Found", "Utilisateur introuvable.", req) }
+    let sortie = unwrap_or(res, ptr_null())
+    if pg_lignes(sortie) != 1 { pg_liberer(sortie); pg_fermer(unwrap_or(conn, ptr_null())); return erreur_json(404, "Not Found", "Utilisateur introuvable.", req) }
+    let answer = "{\"id\":" + json_texte(unwrap_or(pg_valeur(sortie,0,0),"")) + ",\"email\":" + json_texte(unwrap_or(pg_valeur(sortie,0,1),"")) + ",\"name\":" + json_texte(unwrap_or(pg_valeur(sortie,0,2),"")) + ",\"role\":" + json_texte(unwrap_or(pg_valeur(sortie,0,3),"")) + "}"
+    pg_liberer(sortie); pg_fermer(unwrap_or(conn, ptr_null()))
+    return WebResultat.WebOk(reponse_json(answer))
+}
+
+fn api_document(req: Requete, _params: Map<Text>) -> WebResultat {
+    let id = utilisateur(req, unwrap_or(env("NOLIAE_SESSION_SECRET"), ""))
+    if not has(id) { return erreur_json(401, "Unauthorized", "Authentification requise.", req) }
+    let corps = requete_json(req)
+    if not has(corps) { return erreur_json(400, "Bad Request", "JSON invalide.", req) }
+    let source = unwrap_or(corps, "")
+    let titre = json_texte_champ(source, "title")
+    let contenu = json_texte_champ(source, "content")
+    if not has(titre) or not has(contenu) { return erreur_json(422, "Unprocessable Content", "title et content sont obligatoires.", req) }
+    let conn = db()
+    if not has(conn) { return erreur_json(503, "Service Unavailable", "Base PostgreSQL indisponible.", req) }
+    let res = pg_requete_params(unwrap_or(conn, ptr_null()), "INSERT INTO documents(owner_id,title,content) VALUES($1,$2,$3) RETURNING id", [unwrap_or(id,""), unwrap_or(titre,""), unwrap_or(contenu,"")])
+    if not has(res) { pg_fermer(unwrap_or(conn, ptr_null())); return erreur_json(500, "Internal Server Error", "Création du document impossible.", req) }
+    let sortie = unwrap_or(res, ptr_null())
+    let doc_id = unwrap_or(pg_valeur(sortie, 0, 0), "")
+    pg_liberer(sortie); pg_fermer(unwrap_or(conn, ptr_null()))
+    return WebResultat.WebOk(reponse_json("{\"id\":" + json_texte(doc_id) + "}"))
+}
+
+fn api_admin_users(req: Requete, _params: Map<Text>) -> WebResultat {
+    let id = utilisateur(req, unwrap_or(env("NOLIAE_SESSION_SECRET"), ""))
+    if not has(id) { return erreur_json(401, "Unauthorized", "Authentification requise.", req) }
+    let conn = db()
+    if not has(conn) { return erreur_json(503, "Service Unavailable", "Base PostgreSQL indisponible.", req) }
+    let role = pg_requete_params(unwrap_or(conn, ptr_null()), "SELECT role FROM users WHERE id=$1", [unwrap_or(id,"")])
+    if not has(role) or pg_lignes(unwrap_or(role, ptr_null())) != 1 or unwrap_or(pg_valeur(unwrap_or(role, ptr_null()),0,0), "user") != "admin" { if has(role) { pg_liberer(unwrap_or(role,ptr_null())) }; pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(403, "Forbidden", "Droit administrateur requis.", req) }
+    pg_liberer(unwrap_or(role, ptr_null()))
+    let res = pg_requete(unwrap_or(conn, ptr_null()), "SELECT id,email,display_name,role,created_at FROM users ORDER BY id DESC LIMIT 100")
+    if not has(res) { pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(500, "Internal Server Error", "Lecture des utilisateurs impossible.", req) }
+    let sortie = unwrap_or(res, ptr_null())
+    var items = "["
+    var i = 0
+    while i < pg_lignes(sortie) { if i > 0 { items = items + "," }; items = items + "{\"id\":" + json_texte(unwrap_or(pg_valeur(sortie,i,0),"")) + ",\"email\":" + json_texte(unwrap_or(pg_valeur(sortie,i,1),"")) + ",\"name\":" + json_texte(unwrap_or(pg_valeur(sortie,i,2),"")) + ",\"role\":" + json_texte(unwrap_or(pg_valeur(sortie,i,3),"")) + "}"; i = i + 1 }
+    items = items + "]"
+    pg_liberer(sortie); pg_fermer(unwrap_or(conn,ptr_null()))
+    return WebResultat.WebOk(reponse_json(items))
+}
+
+fn api_permissions(req: Requete, _params: Map<Text>) -> WebResultat {
+    let id = utilisateur(req, unwrap_or(env("NOLIAE_SESSION_SECRET"), ""))
+    if not has(id) { return erreur_json(401, "Unauthorized", "Authentification requise.", req) }
+    let conn = db()
+    if not has(conn) { return erreur_json(503, "Service Unavailable", "Base PostgreSQL indisponible.", req) }
+    let res = pg_requete_params(unwrap_or(conn,ptr_null()), "SELECT permission_code FROM user_permissions WHERE user_id=$1 ORDER BY permission_code", [unwrap_or(id,"")])
+    if not has(res) { pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(500,"Internal Server Error","Lecture des permissions impossible.",req) }
+    let sortie = unwrap_or(res,ptr_null())
+    var items = "["
+    var i = 0
+    while i < pg_lignes(sortie) { if i > 0 { items = items + "," }; items = items + json_texte(unwrap_or(pg_valeur(sortie,i,0),"")); i = i + 1 }
+    items = items + "]"
+    pg_liberer(sortie); pg_fermer(unwrap_or(conn,ptr_null()))
+    return WebResultat.WebOk(reponse_json(items))
+}
+
+fn parametre(params: Map<Text>, nom: Text) -> Text { return unwrap_or(map_get(params, nom), "") }
+
+fn api_ia_modele(req: Requete, params: Map<Text>) -> WebResultat {
+    let id = utilisateur(req, unwrap_or(env("NOLIAE_SESSION_SECRET"), ""))
+    if not has(id) { return erreur_json(401,"Unauthorized","Authentification requise.",req) }
+    let fournisseur = parametre(params, "nameid")
+    let modele = parametre(params, "modelia")
+    let texte = parametre(params, "text")
+    if fournisseur == "" or modele == "" or texte == "" { return erreur_json(422,"Unprocessable Content","Fournisseur, modèle et texte sont obligatoires.",req) }
+    let prefix = "NOLCORE_" + upper(fournisseur)
+    let token = unwrap_or(env(prefix + "_TOKEN"), "")
+    var url = unwrap_or(env(prefix + "_URL"), "")
+    if url == "" and fournisseur == "claude" { url = "https://api.anthropic.com/v1/messages" }
+    if url == "" and (fournisseur == "chatgpt" or fournisseur == "openai") { url = "https://api.openai.com/v1/chat/completions" }
+    if url == "" and fournisseur == "mistral" { url = "https://api.mistral.ai/v1/chat/completions" }
+    if url == "" and fournisseur == "gemini" { url = "https://generativelanguage.googleapis.com/v1beta/models/" + modele + ":generateContent" }
+    if fournisseur == "gemini" and has(find(url, "?")) == false { url = url + "?key=" + token }
+    var resultat = "Fournisseur " + fournisseur + " configuré pour le modèle " + modele + "."
+    if url != "" and token != "" {
+        let corps = "{\"model\":" + json_texte(modele) + ",\"messages\":[{\"role\":\"user\",\"content\":" + json_texte(texte) + "}]}"
+        let rep = http_post_token(url, "application/json", corps, token)
+        if has(rep) and unwrap_or(rep, ReponseHttp { statut:0, entetes:"", corps:"" }).statut >= 200 and unwrap_or(rep, ReponseHttp { statut:0, entetes:"", corps:"" }).statut < 300 { resultat = unwrap_or(rep, ReponseHttp { statut:0, entetes:"", corps:"" }).corps }
+    }
+    return WebResultat.WebOk(reponse_json("{\"provider\":" + json_texte(fournisseur) + ",\"model\":" + json_texte(modele) + ",\"result\":" + json_texte(resultat) + "}"))
+}
+
+fn api_user_reset(req: Requete, _params: Map<Text>) -> WebResultat {
+    if not has(utilisateur(req, unwrap_or(env("NOLIAE_SESSION_SECRET"), ""))) { return erreur_json(401,"Unauthorized","Authentification requise.",req) }
+    return api_user_password(req, "reset")
+}
+
+fn api_user_password(req: Requete, _mode: Text) -> WebResultat {
+    let id = utilisateur(req, unwrap_or(env("NOLIAE_SESSION_SECRET"), ""))
+    if not has(id) { return erreur_json(401,"Unauthorized","Authentification requise.",req) }
+    let nouveau = champ_entree(req, "password")
+    if not has(nouveau) or len(unwrap_or(nouveau,"")) < 8 { return erreur_json(422,"Unprocessable Content","password doit contenir au moins 8 caractères.",req) }
+    let hash = mot_de_passe_hache(bytes_from_text(unwrap_or(nouveau,"")))
+    if not has(hash) { return erreur_json(500,"Internal Server Error","Hachage indisponible.",req) }
+    let conn = db()
+    if not has(conn) { return erreur_json(503,"Service Unavailable","Base PostgreSQL indisponible.",req) }
+    let res = pg_requete_params(unwrap_or(conn,ptr_null()), "UPDATE users SET password_hash=$1 WHERE id=$2", [unwrap_or(hash,""),unwrap_or(id,"")])
+    if has(res) { pg_liberer(unwrap_or(res,ptr_null())) }
+    pg_fermer(unwrap_or(conn,ptr_null()))
+    return WebResultat.WebOk(reponse_json("{\"updated\":true}"))
+}
+
+fn api_user_field(req: Requete, champ: Text) -> WebResultat {
+    let id = utilisateur(req, unwrap_or(env("NOLIAE_SESSION_SECRET"), ""))
+    if not has(id) { return erreur_json(401,"Unauthorized","Authentification requise.",req) }
+    let valeur = champ_entree(req, champ)
+    if not has(valeur) or unwrap_or(valeur,"") == "" { return erreur_json(422,"Unprocessable Content","Valeur obligatoire.",req) }
+    let conn = db()
+    if not has(conn) { return erreur_json(503,"Service Unavailable","Base PostgreSQL indisponible.",req) }
+    var sql = "UPDATE users SET display_name=$1 WHERE id=$2"
+    if champ == "email" { sql = "UPDATE users SET email=$1 WHERE id=$2" }
+    let res = pg_requete_params(unwrap_or(conn,ptr_null()), sql, [unwrap_or(valeur,""),unwrap_or(id,"")])
+    if has(res) { pg_liberer(unwrap_or(res,ptr_null())) }
+    pg_fermer(unwrap_or(conn,ptr_null()))
+    return WebResultat.WebOk(reponse_json("{\"updated\":true}"))
+}
+
+fn api_search_text(req: Requete, params: Map<Text>) -> WebResultat {
+    let q = parametre(params, "keyword")
+    if q == "" { return erreur_json(422,"Unprocessable Content","keyword obligatoire.",req) }
+    var copie = req
+    copie.query = "q=" + q
+    return api_search(copie, params)
+}
+
+fn api_search_ia(req: Requete, params: Map<Text>) -> WebResultat {
+    let keyword = parametre(params, "keyword")
+    if keyword == "" { return erreur_json(422,"Unprocessable Content","keyword obligatoire.",req) }
+    var p: Map<Text> = map_new()
+    map_set(p, "nameid", "mistral")
+    map_set(p, "modelia", "search")
+    map_set(p, "text", keyword)
+    return api_ia_modele(req, p)
+}
+
+fn api_crawler_visite(req: Requete, params: Map<Text>) -> WebResultat {
+    let id = utilisateur(req, unwrap_or(env("NOLIAE_SESSION_SECRET"), ""))
+    if not has(id) { return erreur_json(401,"Unauthorized","Authentification requise.",req) }
+    let url = parametre(params,"url")
+    let page = crawler_get_respectueux(url)
+    if not has(page) { return erreur_json(403,"Forbidden","URL refusée par robots.txt ou inaccessible.",req) }
+    return WebResultat.WebOk(reponse_json("{\"url\":" + json_texte(url) + ",\"visited\":true}"))
+}
+
+fn api_crawler_result(req: Requete, params: Map<Text>) -> WebResultat {
+    let id = utilisateur(req, unwrap_or(env("NOLIAE_SESSION_SECRET"), ""))
+    if not has(id) { return erreur_json(401,"Unauthorized","Authentification requise.",req) }
+    let url = parametre(params,"url")
+    let conn = db()
+    if not has(conn) { return erreur_json(503,"Service Unavailable","Base PostgreSQL indisponible.",req) }
+    let res = pg_requete_params(unwrap_or(conn,ptr_null()), "SELECT id,title,content FROM documents WHERE owner_id=$1 AND title=$2 ORDER BY id DESC LIMIT 1", [unwrap_or(id,""),url])
+    if not has(res) { pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(404,"Not Found","Résultat introuvable.",req) }
+    let sortie = unwrap_or(res,ptr_null())
+    if pg_lignes(sortie) != 1 { pg_liberer(sortie); pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(404,"Not Found","Résultat introuvable.",req) }
+    let answer = "{\"id\":" + json_texte(unwrap_or(pg_valeur(sortie,0,0),"")) + ",\"url\":" + json_texte(url) + ",\"content\":" + json_texte(unwrap_or(pg_valeur(sortie,0,2),"")) + "}"
+    pg_liberer(sortie); pg_fermer(unwrap_or(conn,ptr_null()))
+    return WebResultat.WebOk(reponse_json(answer))
+}
+
+fn api_discord_bot(req: Requete, _params: Map<Text>) -> WebResultat {
+    if not has(utilisateur(req, unwrap_or(env("NOLIAE_SESSION_SECRET"), ""))) { return erreur_json(401,"Unauthorized","Authentification requise.",req) }
+    let configured = unwrap_or(env("NOLCORE_DISCORD_BOT_TOKEN"), "") != ""
+    return WebResultat.WebOk(reponse_json("{\"configured\":" + json_bool(configured) + ",\"guild_id\":" + json_texte(unwrap_or(env("NOLCORE_DISCORD_GUILD_ID"),"")) + "}"))
+}
+
+fn api_discord_webhook(req: Requete, _params: Map<Text>) -> WebResultat {
+    if not has(utilisateur(req, unwrap_or(env("NOLIAE_SESSION_SECRET"), ""))) { return erreur_json(401,"Unauthorized","Authentification requise.",req) }
+    let message = champ_entree(req, "content")
+    let webhook = unwrap_or(env("NOLCORE_DISCORD_WEBHOOK_URL"), "")
+    if webhook == "" { return erreur_json(503,"Service Unavailable","Webhook Discord non configuré.",req) }
+    if not has(message) or unwrap_or(message,"") == "" { return erreur_json(422,"Unprocessable Content","content obligatoire.",req) }
+    let rep = http_post(webhook, "application/json", "{\"content\":" + json_texte(unwrap_or(message,"")) + "}")
+    if not has(rep) or unwrap_or(rep,ReponseHttp { statut:0,entetes:"",corps:"" }).statut >= 300 { return erreur_json(502,"Bad Gateway","Discord a refusé le webhook.",req) }
+    return WebResultat.WebOk(reponse_json("{\"sent\":true}"))
+}
+
+fn admin_autorise(req: Requete) -> Bool {
+    let id = utilisateur(req, unwrap_or(env("NOLIAE_SESSION_SECRET"), ""))
+    if not has(id) { return false }
+    let conn = db()
+    if not has(conn) { return false }
+    let res = pg_requete_params(unwrap_or(conn,ptr_null()), "SELECT role FROM users WHERE id=$1", [unwrap_or(id,"")])
+    if not has(res) { pg_fermer(unwrap_or(conn,ptr_null())); return false }
+    let sortie = unwrap_or(res,ptr_null())
+    let ok = pg_lignes(sortie) == 1 and unwrap_or(pg_valeur(sortie,0,0),"") == "admin"
+    pg_liberer(sortie); pg_fermer(unwrap_or(conn,ptr_null()))
+    return ok
+}
+
+fn api_smtp_send(req: Requete, params: Map<Text>) -> WebResultat {
+    if not admin_autorise(req) { return erreur_json(403,"Forbidden","Droit administrateur requis.",req) }
+    let smtp = parametre(params,"idsmtp")
+    let to = champ_entree(req,"to")
+    let subject = champ_entree(req,"subject")
+    let body = champ_entree(req,"body")
+    if smtp == "" or not has(to) or not has(subject) or not has(body) { return erreur_json(422,"Unprocessable Content","smtp, to, subject et body sont obligatoires.",req) }
+    let conn = db()
+    if not has(conn) { return erreur_json(503,"Service Unavailable","PostgreSQL indisponible.",req) }
+    let profile = pg_requete_params(unwrap_or(conn,ptr_null()), "SELECT host,port,username,secret_env FROM smtp_profiles WHERE id=$1 AND enabled=true", [smtp])
+    if not has(profile) or pg_lignes(unwrap_or(profile,ptr_null())) != 1 { if has(profile) { pg_liberer(unwrap_or(profile,ptr_null())) }; pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(404,"Not Found","Profil SMTP introuvable.",req) }
+    let p = unwrap_or(profile,ptr_null())
+    let host = unwrap_or(pg_valeur(p,0,0),"")
+    let port = unwrap_or(parse_int(unwrap_or(pg_valeur(p,0,1),"587")),587)
+    let username = unwrap_or(pg_valeur(p,0,2),"")
+    let secret_env = unwrap_or(pg_valeur(p,0,3),"")
+    let password = unwrap_or(env(secret_env),"")
+    let expediteur = unwrap_or(env("NOLCORE_SMTP_" + upper(smtp) + "_FROM"),username)
+    let ok = smtp_envoyer(host,port,username,password,expediteur,unwrap_or(to,""),unwrap_or(subject,""),unwrap_or(body,""))
+    var status = "failed"
+    if ok { status = "sent" }
+    let res = pg_requete_params(unwrap_or(conn,ptr_null()), "INSERT INTO smtp_outbox(smtp_id,recipient,subject,body,status) VALUES($1,$2,$3,$4,$5) RETURNING id", [smtp,unwrap_or(to,""),unwrap_or(subject,""),unwrap_or(body,""),status])
+    if not has(res) { pg_liberer(p); pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(500,"Internal Server Error","Enregistrement SMTP impossible.",req) }
+    let sortie = unwrap_or(res,ptr_null())
+    let id = unwrap_or(pg_valeur(sortie,0,0),"")
+    pg_liberer(sortie); pg_liberer(p); pg_fermer(unwrap_or(conn,ptr_null()))
+    if not ok { return erreur_json(502,"Bad Gateway","Échec de la livraison SMTP, message conservé en échec.",req) }
+    return WebResultat.WebOk(reponse_json("{\"sent\":true,\"id\":" + json_texte(id) + "}"))
+}
+
+fn api_smtp_pool(req: Requete, params: Map<Text>) -> WebResultat {
+    if not admin_autorise(req) { return erreur_json(403,"Forbidden","Droit administrateur requis.",req) }
+    let conn = db()
+    if not has(conn) { return erreur_json(503,"Service Unavailable","PostgreSQL indisponible.",req) }
+    let res = pg_requete_params(unwrap_or(conn,ptr_null()), "SELECT id,recipient,subject,status FROM smtp_outbox WHERE smtp_id=$1 ORDER BY id DESC LIMIT 100", [parametre(params,"idsmtp")])
+    if not has(res) { pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(500,"Internal Server Error","Pool SMTP indisponible.",req) }
+    let sortie = unwrap_or(res,ptr_null())
+    var items = "["
+    var i = 0
+    while i < pg_lignes(sortie) { if i > 0 { items += "," }; items += "{\"id\":" + json_texte(unwrap_or(pg_valeur(sortie,i,0),"")) + ",\"to\":" + json_texte(unwrap_or(pg_valeur(sortie,i,1),"")) + ",\"subject\":" + json_texte(unwrap_or(pg_valeur(sortie,i,2),"")) + ",\"status\":" + json_texte(unwrap_or(pg_valeur(sortie,i,3),"")) + "}"; i = i + 1 }
+    items += "]"
+    pg_liberer(sortie); pg_fermer(unwrap_or(conn,ptr_null()))
+    return WebResultat.WebOk(reponse_json(items))
+}
+
+fn api_smtp_remove(req: Requete, params: Map<Text>) -> WebResultat {
+    if not admin_autorise(req) { return erreur_json(403,"Forbidden","Droit administrateur requis.",req) }
+    let conn = db()
+    if not has(conn) { return erreur_json(503,"Service Unavailable","PostgreSQL indisponible.",req) }
+    let res = pg_requete_params(unwrap_or(conn,ptr_null()), "DELETE FROM smtp_profiles WHERE id=$1", [parametre(params,"idsmtp")])
+    if has(res) { pg_liberer(unwrap_or(res,ptr_null())) }
+    pg_fermer(unwrap_or(conn,ptr_null()))
+    return WebResultat.WebOk(reponse_json("{\"removed\":true}"))
+}
+
+fn api_admin_smtp_create(req: Requete, _params: Map<Text>) -> WebResultat {
+    if not admin_autorise(req) { return erreur_json(403,"Forbidden","Droit administrateur requis.",req) }
+    let id = champ_entree(req,"id")
+    let host = champ_entree(req,"host")
+    let port = champ_entree(req,"port")
+    let username = champ_entree(req,"username")
+    let secret_env = champ_entree(req,"secret_env")
+    if not has(id) or not has(host) or not has(username) or not has(secret_env) { return erreur_json(422,"Unprocessable Content","id, host, username et secret_env sont obligatoires.",req) }
+    let conn = db()
+    if not has(conn) { return erreur_json(503,"Service Unavailable","PostgreSQL indisponible.",req) }
+    let res = pg_requete_params(unwrap_or(conn,ptr_null()), "INSERT INTO smtp_profiles(id,host,port,username,secret_env) VALUES($1,$2,$3,$4,$5) ON CONFLICT(id) DO UPDATE SET host=$2,port=$3,username=$4,secret_env=$5,enabled=true", [unwrap_or(id,""),unwrap_or(host,""),unwrap_or(port,"587"),unwrap_or(username,""),unwrap_or(secret_env,"")])
+    if has(res) { pg_liberer(unwrap_or(res,ptr_null())) }
+    pg_fermer(unwrap_or(conn,ptr_null()))
+    return WebResultat.WebOk(reponse_json("{\"configured\":true}"))
+}
+
+fn api_admin_config(req: Requete, section: Text) -> WebResultat {
+    if not admin_autorise(req) { return erreur_json(403,"Forbidden","Droit administrateur requis.",req) }
+    var configured = false
+    if section == "ia" { configured = unwrap_or(env("NOLCORE_CHATGPT_TOKEN"),"") != "" or unwrap_or(env("NOLCORE_MISTRAL_TOKEN"),"") != "" }
+    if section == "discord" { configured = unwrap_or(env("NOLCORE_DISCORD_BOT_TOKEN"),"") != "" or unwrap_or(env("NOLCORE_DISCORD_WEBHOOK_URL"),"") != "" }
+    return WebResultat.WebOk(reponse_json("{\"section\":" + json_texte(section) + ",\"configured\":" + json_bool(configured) + "}"))
+}
+
+fn api_crawler(req: Requete, _params: Map<Text>) -> WebResultat {
+    let id = utilisateur(req, unwrap_or(env("NOLIAE_SESSION_SECRET"), ""))
+    if not has(id) { return erreur_json(401, "Unauthorized", "Authentification requise.", req) }
+    let corps = requete_json(req)
+    if not has(corps) { return erreur_json(400, "Bad Request", "JSON invalide.", req) }
+    let url = json_texte_champ(unwrap_or(corps, ""), "url")
+    if not has(url) { return erreur_json(422, "Unprocessable Content", "url est obligatoire.", req) }
+    let page = crawler_get_respectueux(unwrap_or(url, ""))
+    if not has(page) { return erreur_json(403, "Forbidden", "URL refusée par robots.txt ou inaccessible.", req) }
+    let conn = db()
+    if not has(conn) { return erreur_json(503,"Service Unavailable","Base PostgreSQL indisponible.",req) }
+    let saved = pg_requete_params(unwrap_or(conn,ptr_null()), "INSERT INTO documents(owner_id,title,content) VALUES($1,$2,$3) RETURNING id", [unwrap_or(id,""), unwrap_or(url,""), unwrap_or(page,"")])
+    if not has(saved) { pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(500,"Internal Server Error","Indexation impossible.",req) }
+    let result = unwrap_or(saved,ptr_null())
+    let doc_id = unwrap_or(pg_valeur(result,0,0),"")
+    pg_liberer(result); pg_fermer(unwrap_or(conn,ptr_null()))
+    return WebResultat.WebOk(reponse_json("{\"url\":" + json_texte(unwrap_or(url,"")) + ",\"document_id\":" + json_texte(doc_id) + ",\"content\":" + json_texte(unwrap_or(page,"")) + "}"))
+}
+
+fn application(req: Requete) -> WebResultat {
+    var methodes: List<Text> = []
+    var patrons: List<Text> = []
+    var handlers: List<Fn(Requete, Map<Text>) -> WebResultat> = []
+    route_type(methodes, patrons, handlers, "GET", "/api/health", api_sante)
+    route_type(methodes, patrons, handlers, "GET", "/api/ready", api_pret)
+    route_type(methodes, patrons, handlers, "GET", "/api/capacites", api_capacites)
+    route_type(methodes, patrons, handlers, "POST", "/api/auth/register", api_register)
+    route_type(methodes, patrons, handlers, "POST", "/api/auth/login", api_login)
+    route_type(methodes, patrons, handlers, "POST", "/api/chat", api_chat)
+    route_type(methodes, patrons, handlers, "GET", "/api/search", api_search)
+    route_type(methodes, patrons, handlers, "GET", "/api/users/me", api_me)
+    route_type(methodes, patrons, handlers, "POST", "/api/documents", api_document)
+    route_type(methodes, patrons, handlers, "GET", "/api/admin/users", api_admin_users)
+    route_type(methodes, patrons, handlers, "GET", "/v1/user", api_me)
+    route_type(methodes, patrons, handlers, "GET", "/v1/ia", api_chat)
+    route_type(methodes, patrons, handlers, "POST", "/v1/ia", api_chat)
+    route_type(methodes, patrons, handlers, "POST", "/v1/crawler", api_crawler)
+    route_type(methodes, patrons, handlers, "GET", "/v1/search", api_search)
+    route_type(methodes, patrons, handlers, "GET", "/v1/perms", api_permissions)
+    route_type(methodes, patrons, handlers, "GET", "/v1/admin/users", api_admin_users)
+    route_type(methodes, patrons, handlers, "GET", "/v1/admin/", api_admin_users)
+    route_type(methodes, patrons, handlers, "POST", "/v1/auth/register", api_register)
+    route_type(methodes, patrons, handlers, "POST", "/v1/auth/login", api_login)
+    route_type(methodes, patrons, handlers, "POST", "/v1/user/register", api_register)
+    route_type(methodes, patrons, handlers, "POST", "/v1/user/login", api_login)
+    route_type(methodes, patrons, handlers, "GET", "/v1/user/verify", api_verify_email)
+    route_type(methodes, patrons, handlers, "GET", "/v1/user/me", api_me)
+    route_type(methodes, patrons, handlers, "POST", "/v1/user/resetpassword", api_user_reset)
+    route_type(methodes, patrons, handlers, "POST", "/v1/user/me/changepassword", fn (r: Requete, _p: Map<Text>) -> WebResultat { return api_user_password(r, "change") })
+    route_type(methodes, patrons, handlers, "POST", "/v1/user/me/changemail", fn (r: Requete, _p: Map<Text>) -> WebResultat { return api_user_field(r, "email") })
+    route_type(methodes, patrons, handlers, "POST", "/v1/user/me/changename", fn (r: Requete, _p: Map<Text>) -> WebResultat { return api_user_field(r, "name") })
+    route_type(methodes, patrons, handlers, "POST", "/v1/ia/:nameid/:modelia/:text", api_ia_modele)
+    route_type(methodes, patrons, handlers, "GET", "/v1/search/text/:keyword", api_search_text)
+    route_type(methodes, patrons, handlers, "GET", "/v1/search/img/:keyword", api_search_text)
+    route_type(methodes, patrons, handlers, "GET", "/v1/search/ia/:keyword", api_search_ia)
+    route_type(methodes, patrons, handlers, "POST", "/v1/crawler/visite/:url", api_crawler_visite)
+    route_type(methodes, patrons, handlers, "GET", "/v1/crawler/result/:url", api_crawler_result)
+    route_type(methodes, patrons, handlers, "GET", "/v1/discord/bot", api_discord_bot)
+    route_type(methodes, patrons, handlers, "POST", "/v1/discord/webhook", api_discord_webhook)
+    route_type(methodes, patrons, handlers, "POST", "/v1/smtp/:idsmtp/send", api_smtp_send)
+    route_type(methodes, patrons, handlers, "GET", "/v1/smtp/:idsmtp/pool", api_smtp_pool)
+    route_type(methodes, patrons, handlers, "DELETE", "/v1/smtp/:idsmtp/remove", api_smtp_remove)
+    route_type(methodes, patrons, handlers, "GET", "/v1/admin/user/", api_admin_users)
+    route_type(methodes, patrons, handlers, "GET", "/v1/admin/ia/", fn (r: Requete, _p: Map<Text>) -> WebResultat { return api_admin_config(r,"ia") })
+    route_type(methodes, patrons, handlers, "GET", "/v1/admin/smtp/", fn (r: Requete, _p: Map<Text>) -> WebResultat { return api_admin_config(r,"smtp") })
+    route_type(methodes, patrons, handlers, "POST", "/v1/admin/smtp/", api_admin_smtp_create)
+    route_type(methodes, patrons, handlers, "GET", "/v1/admin/crawler/", fn (r: Requete, _p: Map<Text>) -> WebResultat { return api_admin_config(r,"crawler") })
+    route_type(methodes, patrons, handlers, "GET", "/v1/admin/discord/", fn (r: Requete, _p: Map<Text>) -> WebResultat { return api_admin_config(r,"discord") })
+    return routeur_dispatch_type(methodes, patrons, handlers, req)
+}
+
+fn main() {
+    let secret = unwrap_or(env("NOLIAE_SESSION_SECRET"), "")
+    if len(secret) < 32 { print("NOLIAE_SESSION_SECRET doit contenir au moins 32 caracteres"); return }
+    let port = unwrap_or(parse_int(unwrap_or(env("NOLIAE_PORT"), "8080")), 8080)
+    let limites = web_limites_defaut()
+    var pre: List<Fn(Requete) -> Option<Reponse>> = []
+    var post: List<Fn(Requete, Reponse) -> Reponse> = []
+    push(post, middleware_securite)
+    push(post, middleware_request_id)
+    print("NolCore sur http://0.0.0.0:" + text(port))
+    let ecoute = tcp_listen(port)
+    if not has(ecoute) { print("port indisponible"); return }
+    let serveur = unwrap_or(ecoute, -1)
+    while true {
+        let venu = tcp_accept(serveur)
+        if has(venu) {
+            let client = unwrap_or(venu, -1)
+            let requete = unwrap_or(tcp_read(client), "")
+            let reponse = web_repondre_resultat_pre(requete, limites, application, pre, post)
+            let _ecrit = tcp_write(client, reponse)
+            tcp_close(client)
+        }
+    }
+}
