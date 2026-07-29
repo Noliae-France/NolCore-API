@@ -1,6 +1,6 @@
 <div align="center">
 
-# ◈ NolCore
+# ◈ NolCore API
 
 ## NolCore-API — gateway public
 
@@ -22,9 +22,15 @@ Un backend MVC natif en **Nolc** pour construire les services de [noliae.com](ht
 
 ## Pourquoi NolCore ?
 
-NolCore est le socle partagé des applications Noliae. Il regroupe dans un seul
-service natif les briques qui doivent rester cohérentes partout : sécurité,
-comptes, permissions, IA, moteur de recherche, crawler et administration.
+NolCore API est le gateway métier des applications Noliae : sécurité, comptes,
+permissions, recherche PostgreSQL, sessions, administration et intégrations.
+Il ne contient ni moteur de crawling ni connecteurs de fournisseurs IA.
+
+Les appels IA sont délégués à
+[NolCore-IA](https://github.com/Noliae-France/NolCore-IA) par `NOLCORE_IA_URL`
+et le crawling à
+[NolCore-Crawler](https://github.com/Noliae-France/NolCore-Crawler) par
+`NOLCORE_CRAWLER_URL`.
 
 Nous avons décidé de montrer le code source de nos apps et de notre cœur :
 la transparence permet aux utilisateurs, développeurs et auditeurs de comprendre
@@ -35,12 +41,12 @@ Noliae plutôt que de dépendre d’une boîte noire.
 
 | Domaine | Ce que fournit NolCore |
 |---|---|
-| API | Routeur Nolc, contrôleurs et services natifs ; les `.nhtml` sont indicatifs |
+| API | Routeur Nolc, contrôleurs, PostgreSQL et services natifs |
 | Users & Auth | Inscription, connexion, profil, changement de compte, sessions 24 h |
 | Sessions | Cookie signé lié à l’utilisateur, l’email, l’IP, l’horodatage et un nonce aléatoire |
-| IA | Agrégation Claude, ChatGPT, Mistral et Gemini par fournisseur/modèle |
+| IA | Routage authentifié vers NolCore-IA |
 | Recherche | Index PostgreSQL plein texte, recherche textuelle, IA et base pour images |
-| Crawler | Visite HTTP, lecture de `robots.txt`, refus des chemins interdits et indexation |
+| Crawler | Routage authentifié vers NolCore-Crawler |
 | Permissions | Permissions par utilisateur, rôles et audit des actions |
 | Administration | Gestion des utilisateurs et supervision du cœur |
 | Intégrations | Bot Discord et webhook Discord configurables |
@@ -48,13 +54,9 @@ Noliae plutôt que de dépendre d’une boîte noire.
 ## Architecture
 
 ```text
-NolCore
+NolCore API
 ├── main.nol                 # routeur + boucle HTTP
-├── examples/mvc/            # Exemples indicatifs de pages, hors du core
-│   ├── *.nhtml              # Gabarits accueil, login, inscription, recherche
-│   └── static/              # CSS de démonstration
 ├── schema.sql               # PostgreSQL et migrations initiales
-├── crawler.nol              # HTTP + politique robots.txt
 ├── vendor/nolc/lib/         # stdlib Nolc compatible avec le binaire public
 ├── Dockerfile
 └── docker-compose.yml
@@ -92,14 +94,12 @@ Secrets/Vault), jamais par un fichier versionné.
 ## Démarrage rapide API
 
 ```sh
-git clone https://github.com/Noliae-France/NolCore.git
-cd NolCore
+git clone https://github.com/Noliae-France/NolCore-API.git
+cd NolCore-API
 docker compose up --build
 ```
 
 Le conteneur expose uniquement l’API HTTP sur `http://localhost:8080`.
-Les exemples `.nhtml` sont regroupés dans [`examples/mvc`](examples/mvc) : ils
-ne sont ni compilés ni servis par le core.
 
 Les valeurs par défaut de Compose sont destinées au développement local. En
 production, fournir les secrets par l’environnement ou le gestionnaire de
@@ -152,9 +152,9 @@ POST /v1/crawler/visite/:url
 GET  /v1/crawler/result/:url
 ```
 
-Le crawler ne visite une URL qu’après lecture de son `robots.txt`. Les pages
-acceptées sont indexées dans PostgreSQL et deviennent disponibles dans la
-recherche de l’utilisateur.
+Le crawler est exécuté par
+[NolCore-Crawler](https://github.com/Noliae-France/NolCore-Crawler), qui
+applique `robots.txt`. L’API conserve les résultats indexés dans PostgreSQL.
 
 ### Permissions, administration et Discord
 

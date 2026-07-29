@@ -47,6 +47,10 @@ spec:
                   key: postgres-password
             - name: NOLCORE_DATABASE_URL
               value: postgres://nolcore:$(POSTGRES_PASSWORD)@postgres:5432/nolcore
+            - name: NOLCORE_CRAWLER_URL
+              value: http://nolcore-crawler:8091
+            - name: NOLCORE_IA_URL
+              value: http://nolcore-ia:8092
           envFrom:
             - secretRef:
                 name: nolcore-secrets

@@ -3,7 +3,6 @@ import "../nolc/lib/pg.nol"
 import "../nolc/lib/json.nol"
 import "../nolc/lib/sodium.nol"
 import "../nolc/lib/temps.nol"
-import "crawler.nol"
 import "../nolc/lib/http_client.nol"
 import "smtp.nol"
 
@@ -165,17 +164,12 @@ fn api_chat(req: Requete, _params: Map<Text>) -> WebResultat {
     if has(saved) { pg_liberer(unwrap_or(saved,ptr_null())) }
     let fournisseur = unwrap_or(env("NOLCORE_DEFAULT_PROVIDER"), "chatgpt")
     let modele = unwrap_or(env("NOLCORE_DEFAULT_MODEL"), "gpt-4o-mini")
-    let prefix = "NOLCORE_" + upper(fournisseur)
-    let token = unwrap_or(env(prefix + "_TOKEN"), "")
-    var url = unwrap_or(env(prefix + "_URL"), "")
-    if url == "" and (fournisseur == "chatgpt" or fournisseur == "openai") { url = "https://api.openai.com/v1/chat/completions" }
-    if url == "" and fournisseur == "claude" { url = "https://api.anthropic.com/v1/messages" }
-    if url == "" and fournisseur == "mistral" { url = "https://api.mistral.ai/v1/chat/completions" }
-    if url == "" and fournisseur == "gemini" { url = "https://generativelanguage.googleapis.com/v1beta/models/" + modele + ":generateContent?key=" + token }
-    if token == "" { pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(503,"Service Unavailable","Aucun token IA configuré.",req) }
-    let ia = http_post_token(url, "application/json", "{\"model\":" + json_texte(modele) + ",\"messages\":[{\"role\":\"user\",\"content\":" + json_texte(unwrap_or(message,"")) + "}]}", token)
-    if not has(ia) or unwrap_or(ia,ReponseHttp { statut:0,entetes:"",corps:"" }).statut >= 300 { pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(502,"Bad Gateway","Le fournisseur IA est indisponible.",req) }
-    let answer = unwrap_or(ia,ReponseHttp { statut:0,entetes:"",corps:"" }).corps
+    let service_url = unwrap_or(env("NOLCORE_IA_URL"), "")
+    if service_url == "" { pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(503,"Service Unavailable","Service IA non configuré.",req) }
+    let body = "{\"provider\":" + json_texte(fournisseur) + ",\"model\":" + json_texte(modele) + ",\"text\":" + json_texte(unwrap_or(message,"")) + "}"
+    let ia = http_post(service_url + "/v1/ia", "application/json", body)
+    if not has(ia) or unwrap_or(ia,ReponseHttp { statut:0, entetes:"", corps:"" }).statut >= 300 { pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(502,"Bad Gateway","Service IA indisponible.",req) }
+    let answer = unwrap_or(ia,ReponseHttp { statut:0, entetes:"", corps:"" }).corps
     let saved_answer = pg_requete_params(unwrap_or(conn, ptr_null()), "INSERT INTO messages(conversation_id,role,content) VALUES($1,'assistant',$2)", [conv_id, answer])
     if has(saved_answer) { pg_liberer(unwrap_or(saved_answer,ptr_null())) }
     pg_fermer(unwrap_or(conn, ptr_null()))
@@ -330,21 +324,7 @@ fn api_ia_modele(req: Requete, params: Map<Text>) -> WebResultat {
         if reponse.statut >= 300 { return erreur_json(502,"Bad Gateway","Service IA indisponible.",req) }
         return WebResultat.WebOk(reponse_json(reponse.corps))
     }
-    let prefix = "NOLCORE_" + upper(fournisseur)
-    let token = unwrap_or(env(prefix + "_TOKEN"), "")
-    var url = unwrap_or(env(prefix + "_URL"), "")
-    if url == "" and fournisseur == "claude" { url = "https://api.anthropic.com/v1/messages" }
-    if url == "" and (fournisseur == "chatgpt" or fournisseur == "openai") { url = "https://api.openai.com/v1/chat/completions" }
-    if url == "" and fournisseur == "mistral" { url = "https://api.mistral.ai/v1/chat/completions" }
-    if url == "" and fournisseur == "gemini" { url = "https://generativelanguage.googleapis.com/v1beta/models/" + modele + ":generateContent" }
-    if fournisseur == "gemini" and has(find(url, "?")) == false { url = url + "?key=" + token }
-    var resultat = "Fournisseur " + fournisseur + " configuré pour le modèle " + modele + "."
-    if url != "" and token != "" {
-        let corps = "{\"model\":" + json_texte(modele) + ",\"messages\":[{\"role\":\"user\",\"content\":" + json_texte(texte) + "}]}"
-        let rep = http_post_token(url, "application/json", corps, token)
-        if has(rep) and unwrap_or(rep, ReponseHttp { statut:0, entetes:"", corps:"" }).statut >= 200 and unwrap_or(rep, ReponseHttp { statut:0, entetes:"", corps:"" }).statut < 300 { resultat = unwrap_or(rep, ReponseHttp { statut:0, entetes:"", corps:"" }).corps }
-    }
-    return WebResultat.WebOk(reponse_json("{\"provider\":" + json_texte(fournisseur) + ",\"model\":" + json_texte(modele) + ",\"result\":" + json_texte(resultat) + "}"))
+    return erreur_json(503,"Service Unavailable","Service IA non configuré.",req)
 }
 
 fn api_user_reset(req: Requete, _params: Map<Text>) -> WebResultat {
@@ -412,9 +392,7 @@ fn api_crawler_visite(req: Requete, params: Map<Text>) -> WebResultat {
         if reponse.statut >= 300 { return erreur_json(502,"Bad Gateway","Service crawler indisponible.",req) }
         return WebResultat.WebOk(reponse_json(reponse.corps))
     }
-    let page = crawler_get_respectueux(url)
-    if not has(page) { return erreur_json(403,"Forbidden","URL refusée par robots.txt ou inaccessible.",req) }
-    return WebResultat.WebOk(reponse_json("{\"url\":" + json_texte(url) + ",\"visited\":true}"))
+    return erreur_json(503,"Service Unavailable","Service crawler non configuré.",req)
 }
 
 fn api_crawler_result(req: Requete, params: Map<Text>) -> WebResultat {
@@ -541,25 +519,6 @@ fn api_admin_config(req: Requete, section: Text) -> WebResultat {
     return WebResultat.WebOk(reponse_json("{\"section\":" + json_texte(section) + ",\"configured\":" + json_bool(configured) + "}"))
 }
 
-fn api_crawler(req: Requete, _params: Map<Text>) -> WebResultat {
-    let id = utilisateur(req, unwrap_or(env("NOLIAE_SESSION_SECRET"), ""))
-    if not has(id) { return erreur_json(401, "Unauthorized", "Authentification requise.", req) }
-    let corps = requete_json(req)
-    if not has(corps) { return erreur_json(400, "Bad Request", "JSON invalide.", req) }
-    let url = json_texte_champ(unwrap_or(corps, ""), "url")
-    if not has(url) { return erreur_json(422, "Unprocessable Content", "url est obligatoire.", req) }
-    let page = crawler_get_respectueux(unwrap_or(url, ""))
-    if not has(page) { return erreur_json(403, "Forbidden", "URL refusée par robots.txt ou inaccessible.", req) }
-    let conn = db()
-    if not has(conn) { return erreur_json(503,"Service Unavailable","Base PostgreSQL indisponible.",req) }
-    let saved = pg_requete_params(unwrap_or(conn,ptr_null()), "INSERT INTO documents(owner_id,title,content) VALUES($1,$2,$3) RETURNING id", [unwrap_or(id,""), unwrap_or(url,""), unwrap_or(page,"")])
-    if not has(saved) { pg_fermer(unwrap_or(conn,ptr_null())); return erreur_json(500,"Internal Server Error","Indexation impossible.",req) }
-    let result = unwrap_or(saved,ptr_null())
-    let doc_id = unwrap_or(pg_valeur(result,0,0),"")
-    pg_liberer(result); pg_fermer(unwrap_or(conn,ptr_null()))
-    return WebResultat.WebOk(reponse_json("{\"url\":" + json_texte(unwrap_or(url,"")) + ",\"document_id\":" + json_texte(doc_id) + ",\"content\":" + json_texte(unwrap_or(page,"")) + "}"))
-}
-
 fn application(req: Requete) -> WebResultat {
     var methodes: List<Text> = []
     var patrons: List<Text> = []
@@ -578,7 +537,6 @@ fn application(req: Requete) -> WebResultat {
     route_type(methodes, patrons, handlers, "GET", "/v1/user", api_me)
     route_type(methodes, patrons, handlers, "GET", "/v1/ia", api_chat)
     route_type(methodes, patrons, handlers, "POST", "/v1/ia", api_chat)
-    route_type(methodes, patrons, handlers, "POST", "/v1/crawler", api_crawler)
     route_type(methodes, patrons, handlers, "GET", "/v1/search", api_search)
     route_type(methodes, patrons, handlers, "GET", "/v1/perms", api_permissions)
     route_type(methodes, patrons, handlers, "GET", "/v1/admin/users", api_admin_users)

@@ -14,6 +14,23 @@ services:
       NOLIAE_PORT: 8080
       NOLIAE_SESSION_SECRET: ${NOLIAE_SESSION_SECRET:-dev-secret-change-me-please-32chars}
       NOLCORE_DATABASE_URL: postgres://nolcore:nolcore_dev_only@postgres:5432/nolcore
+      NOLCORE_CRAWLER_URL: http://crawler:8091
+      NOLCORE_IA_URL: http://ia:8092
+      NOLCORE_DISCORD_BOT_TOKEN: ${NOLCORE_DISCORD_BOT_TOKEN:-}
+      NOLCORE_DISCORD_GUILD_ID: ${NOLCORE_DISCORD_GUILD_ID:-}
+      NOLCORE_DISCORD_WEBHOOK_URL: ${NOLCORE_DISCORD_WEBHOOK_URL:-}
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      crawler: {condition: service_started}
+      ia: {condition: service_started}
+  crawler:
+    image: ghcr.io/noliae-france/nolcore-crawler:main
+    expose: ["8091"]
+  ia:
+    image: ghcr.io/noliae-france/nolcore-ia:main
+    expose: ["8092"]
+    environment:
       NOLCORE_CLAUDE_URL: ${NOLCORE_CLAUDE_URL:-}
       NOLCORE_CLAUDE_TOKEN: ${NOLCORE_CLAUDE_TOKEN:-}
       NOLCORE_CHATGPT_URL: ${NOLCORE_CHATGPT_URL:-}
@@ -22,9 +39,4 @@ services:
       NOLCORE_MISTRAL_TOKEN: ${NOLCORE_MISTRAL_TOKEN:-}
       NOLCORE_GEMINI_URL: ${NOLCORE_GEMINI_URL:-}
       NOLCORE_GEMINI_TOKEN: ${NOLCORE_GEMINI_TOKEN:-}
-      NOLCORE_DISCORD_BOT_TOKEN: ${NOLCORE_DISCORD_BOT_TOKEN:-}
-      NOLCORE_DISCORD_GUILD_ID: ${NOLCORE_DISCORD_GUILD_ID:-}
-      NOLCORE_DISCORD_WEBHOOK_URL: ${NOLCORE_DISCORD_WEBHOOK_URL:-}
-    ports: ["8080:8080"]
-    depends_on: {postgres: {condition: service_healthy}}
 volumes: {nolcore_pg:}
