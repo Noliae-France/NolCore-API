@@ -1,11 +1,8 @@
-name: Publish NolCore container
+name: Publish API container
 on:
   push:
     branches: [main]
-    tags: ['v*.*.*']
-permissions:
-  contents: read
-  packages: write
+permissions: {contents: read, packages: write}
 jobs:
   image:
     runs-on: ubuntu-latest
@@ -16,17 +13,8 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: ghcr.io/noliae-france/nolcore
-          tags: |
-            type=raw,value=main,enable={{is_default_branch}}
-            type=ref,event=tag
-            type=sha
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ghcr.io/noliae-france/nolcore-api:main

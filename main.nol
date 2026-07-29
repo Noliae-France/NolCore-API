@@ -308,6 +308,15 @@ fn api_ia_modele(req: Requete, params: Map<Text>) -> WebResultat {
     let modele = parametre(params, "modelia")
     let texte = parametre(params, "text")
     if fournisseur == "" or modele == "" or texte == "" { return erreur_json(422,"Unprocessable Content","Fournisseur, modèle et texte sont obligatoires.",req) }
+    let service_url = unwrap_or(env("NOLCORE_IA_URL"), "")
+    if service_url != "" {
+        let body = "{\"provider\":" + json_texte(fournisseur) + ",\"model\":" + json_texte(modele) + ",\"text\":" + json_texte(texte) + "}"
+        let service = http_post(service_url + "/v1/ia", "application/json", body)
+        if not has(service) { return erreur_json(502,"Bad Gateway","Service IA indisponible.",req) }
+        let reponse = unwrap_or(service, ReponseHttp { statut:0, entetes:"", corps:"" })
+        if reponse.statut >= 300 { return erreur_json(502,"Bad Gateway","Service IA indisponible.",req) }
+        return WebResultat.WebOk(reponse_json(reponse.corps))
+    }
     let prefix = "NOLCORE_" + upper(fournisseur)
     let token = unwrap_or(env(prefix + "_TOKEN"), "")
     var url = unwrap_or(env(prefix + "_URL"), "")
@@ -382,6 +391,14 @@ fn api_crawler_visite(req: Requete, params: Map<Text>) -> WebResultat {
     let id = utilisateur(req, unwrap_or(env("NOLIAE_SESSION_SECRET"), ""))
     if not has(id) { return erreur_json(401,"Unauthorized","Authentification requise.",req) }
     let url = parametre(params,"url")
+    let service_url = unwrap_or(env("NOLCORE_CRAWLER_URL"), "")
+    if service_url != "" {
+        let service = http_post(service_url + "/v1/crawler/visite", "application/json", "{\"url\":" + json_texte(url) + "}")
+        if not has(service) { return erreur_json(502,"Bad Gateway","Service crawler indisponible.",req) }
+        let reponse = unwrap_or(service, ReponseHttp { statut:0, entetes:"", corps:"" })
+        if reponse.statut >= 300 { return erreur_json(502,"Bad Gateway","Service crawler indisponible.",req) }
+        return WebResultat.WebOk(reponse_json(reponse.corps))
+    }
     let page = crawler_get_respectueux(url)
     if not has(page) { return erreur_json(403,"Forbidden","URL refusée par robots.txt ou inaccessible.",req) }
     return WebResultat.WebOk(reponse_json("{\"url\":" + json_texte(url) + ",\"visited\":true}"))

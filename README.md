@@ -2,6 +2,13 @@
 
 # ◈ NolCore
 
+## NolCore-API — gateway public
+
+Ce dépôt est le gateway API et le service d’identité/administration. Le
+crawler et l’agrégateur IA sont des binaires et dépôts séparés. Configurez
+`NOLCORE_CRAWLER_URL` et `NOLCORE_IA_URL` pour déléguer leurs routes au réseau
+interne Kubernetes.
+
 ### Le cœur open source de Noliae
 
 Un backend MVC natif en **Nolc** pour construire les services de [noliae.com](https://noliae.com) : identité, IA, recherche, crawling et intégrations.
