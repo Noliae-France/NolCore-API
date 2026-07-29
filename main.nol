@@ -62,6 +62,19 @@ fn api_sante(_req: Requete, _params: Map<Text>) -> WebResultat {
     return WebResultat.WebOk(reponse_json("{\"status\":\"ok\",\"runtime\":\"nolc\",\"service\":\"nolcore\"}"))
 }
 
+fn api_dependances(req: Requete, _params: Map<Text>) -> WebResultat {
+    let crawler_url = unwrap_or(env("NOLCORE_CRAWLER_URL"), "")
+    let ia_url = unwrap_or(env("NOLCORE_IA_URL"), "")
+    if crawler_url == "" or ia_url == "" { return erreur_json(503,"Service Unavailable","Services internes non configurés.",req) }
+    let crawler = http_get(crawler_url + "/api/health")
+    let ia = http_get(ia_url + "/api/health")
+    if not has(crawler) or not has(ia) { return erreur_json(503,"Service Unavailable","Une dépendance interne est indisponible.",req) }
+    let crawler_rep = unwrap_or(crawler,ReponseHttp {statut:0,entetes:"",corps:""})
+    let ia_rep = unwrap_or(ia,ReponseHttp {statut:0,entetes:"",corps:""})
+    if crawler_rep.statut >= 300 or ia_rep.statut >= 300 { return erreur_json(503,"Service Unavailable","Une dépendance interne est indisponible.",req) }
+    return WebResultat.WebOk(reponse_json("{\"status\":\"ok\",\"crawler\":\"ok\",\"ia\":\"ok\"}"))
+}
+
 fn api_pret(_req: Requete, _params: Map<Text>) -> WebResultat {
     let conn = db()
     if not has(conn) { return erreur_json(503,"Service Unavailable","PostgreSQL indisponible.",_req) }
@@ -552,6 +565,7 @@ fn application(req: Requete) -> WebResultat {
     var patrons: List<Text> = []
     var handlers: List<Fn(Requete, Map<Text>) -> WebResultat> = []
     route_type(methodes, patrons, handlers, "GET", "/api/health", api_sante)
+    route_type(methodes, patrons, handlers, "GET", "/api/dependencies", api_dependances)
     route_type(methodes, patrons, handlers, "GET", "/api/ready", api_pret)
     route_type(methodes, patrons, handlers, "GET", "/api/capacites", api_capacites)
     route_type(methodes, patrons, handlers, "POST", "/api/auth/register", api_register)
