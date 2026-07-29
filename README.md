@@ -2,216 +2,134 @@
 
 # ◈ NolCore API
 
-## NolCore-API — gateway public
+### Gateway métier de Noliae, natif en Nolc
 
-Ce dépôt est le gateway API et le service d’identité/administration. Le
-crawler et l’agrégateur IA sont des binaires et dépôts séparés. Configurez
-`NOLCORE_CRAWLER_URL` et `NOLCORE_IA_URL` pour déléguer leurs routes au réseau
-interne Kubernetes.
-
-### Le cœur open source de Noliae
-
-Un backend MVC natif en **Nolc** pour construire les services de [noliae.com](https://noliae.com) : identité, IA, recherche, crawling et intégrations.
-
-[![CI](https://github.com/Noliae-France/NolCore/actions/workflows/ci.yml/badge.svg)](https://github.com/Noliae-France/NolCore/actions/workflows/ci.yml)
-[![Runtime](https://img.shields.io/badge/runtime-Nolc%20native-ff4d2e)](https://github.com/Noliae-France/nolc)
-[![Database](https://img.shields.io/badge/database-PostgreSQL-336791)](https://www.postgresql.org/)
-[![License](https://img.shields.io/badge/license-MIT-2ea44f)](LICENSE)
+[![CI](https://github.com/Noliae-France/NolCore-API/actions/workflows/ci.yml/badge.svg)](https://github.com/Noliae-France/NolCore-API/actions/workflows/ci.yml)
+[![Container](https://github.com/Noliae-France/NolCore-API/actions/workflows/container.yml/badge.svg)](https://github.com/Noliae-France/NolCore-API/actions/workflows/container.yml)
+[![Runtime](https://img.shields.io/badge/runtime-Nolc-ff4d2e)](https://github.com/Noliae-France/nolc)
+[![Licence MIT](https://img.shields.io/badge/licence-MIT-2ea44f)](LICENSE)
 
 </div>
 
-## Pourquoi NolCore ?
+## Rôle du service
 
-NolCore API est le gateway métier des applications Noliae : sécurité, comptes,
-permissions, recherche PostgreSQL, sessions, administration et intégrations.
-Il ne contient ni moteur de crawling ni connecteurs de fournisseurs IA.
+NolCore-API est l’API publique et la source de vérité métier : comptes,
+authentification, sessions, permissions, administration, recherche,
+conversations et SMTP. Il persiste ses données dans PostgreSQL.
 
-Les appels IA sont délégués à
-[NolCore-IA](https://github.com/Noliae-France/NolCore-IA) par `NOLCORE_IA_URL`
-et le crawling à
-[NolCore-Crawler](https://github.com/Noliae-France/NolCore-Crawler) par
-`NOLCORE_CRAWLER_URL`.
-
-Nous avons décidé de montrer le code source de nos apps et de notre cœur :
-la transparence permet aux utilisateurs, développeurs et auditeurs de comprendre
-les garanties du produit, de proposer des améliorations et de construire avec
-Noliae plutôt que de dépendre d’une boîte noire.
-
-## Fonctionnalités
-
-| Domaine | Ce que fournit NolCore |
-|---|---|
-| API | Routeur Nolc, contrôleurs, PostgreSQL et services natifs |
-| Users & Auth | Inscription, connexion, profil, changement de compte, sessions 24 h |
-| Sessions | Cookie signé lié à l’utilisateur, l’email, l’IP, l’horodatage et un nonce aléatoire |
-| IA | Routage authentifié vers NolCore-IA |
-| Recherche | Index PostgreSQL plein texte, recherche textuelle, IA et base pour images |
-| Crawler | Routage authentifié vers NolCore-Crawler |
-| Permissions | Permissions par utilisateur, rôles et audit des actions |
-| Administration | Gestion des utilisateurs et supervision du cœur |
-| Intégrations | Bot Discord et webhook Discord configurables |
-
-## Architecture
+Il ne contient volontairement ni crawler local ni token de fournisseur IA :
 
 ```text
-NolCore API
-├── main.nol                 # routeur + boucle HTTP
-├── schema.sql               # PostgreSQL et migrations initiales
-├── vendor/nolc/lib/         # stdlib Nolc compatible avec le binaire public
-├── Dockerfile
-└── docker-compose.yml
+Internet → NolCore-API → PostgreSQL
+                         ├→ NolCore-IA       via NOLCORE_IA_URL
+                         └→ NolCore-Crawler  via NOLCORE_CRAWLER_URL
 ```
 
-Le serveur est un binaire natif Nolc. PostgreSQL est le seul service de
-persistance ; les requêtes venant de l’extérieur passent par des paramètres
-libpq et ne sont pas concaténées au SQL.
+Les services amont doivent rester privés dans Docker/Kubernetes. L’API est le
+seul composant destiné à recevoir le trafic utilisateur.
 
-### Kubernetes / K3s
+## Capacités
 
-Le dossier `deploy/k8s/base` fournit un déploiement Kustomize avec deux
-réplicas API, PostgreSQL persistant, probes `/api/health` et `/api/ready`,
-Service et Ingress. L’image `ghcr.io/noliae-france/nolcore:main` est publiée
-par GitHub Actions après chaque push sur `main`.
+| Domaine | Contenu |
+|---|---|
+| Users & Auth | Inscription, e-mail de vérification, login, profil et changement de compte |
+| Sessions | Token Bearer et cookie signé, IP + e-mail + nonce, validité 24 h |
+| Permissions | Rôles, permissions ciblées et contrôle administrateur |
+| Recherche | Documents PostgreSQL et routes texte/image/IA |
+| Conversations | Historique utilisateur et délégation vers NolCore-IA |
+| Intégrations | SMTP sécurisé, bot Discord et webhook |
+| Opérations | Santé, readiness, dépendances et administration |
 
-Créer les secrets hors dépôt, puis déployer :
-
-```sh
-kubectl -n nolcore create secret generic nolcore-secrets \
-  --from-literal=postgres-password='mot-de-passe-fort' \
-  --from-literal=session-secret="$(openssl rand -hex 32)" \
-  --from-literal=NOLCORE_CHATGPT_TOKEN='' \
-  --dry-run=client -o yaml | kubectl apply -f -
-kubectl apply -k deploy/k8s/base
-kubectl -n nolcore rollout status statefulset/postgres
-kubectl -n nolcore rollout status deployment/nolcore-api
-```
-
-Pour K3s, la même commande fonctionne ; remplacer l’Ingress par la classe
-installée dans le cluster si nécessaire. Les tokens IA, SMTP et Discord sont
-également fournis par `nolcore-secrets` ou par un Secret externe (External
-Secrets/Vault), jamais par un fichier versionné.
-
-## Démarrage rapide API
+## Lancer localement
 
 ```sh
 git clone https://github.com/Noliae-France/NolCore-API.git
 cd NolCore-API
+export NOLIAE_SESSION_SECRET="change-me-with-at-least-32-characters"
 docker compose up --build
 ```
 
-Le conteneur expose uniquement l’API HTTP sur `http://localhost:8080`.
+Compose démarre PostgreSQL et consomme les images publiques de
+`nolcore-ia` et `nolcore-crawler`. L’API répond sur `http://localhost:8080`.
 
-Les valeurs par défaut de Compose sont destinées au développement local. En
-production, fournir les secrets par l’environnement ou le gestionnaire de
-secrets de la plateforme : ne jamais les commiter.
+```sh
+curl http://localhost:8080/api/health
+curl http://localhost:8080/api/ready
+curl http://localhost:8080/api/dependencies
+```
+
+## Configuration
+
+| Variable | Requise | Description |
+|---|---:|---|
+| `NOLIAE_SESSION_SECRET` | Oui | Secret de signature, 32 caractères minimum |
+| `NOLCORE_DATABASE_URL` | Oui | Connexion PostgreSQL |
+| `NOLCORE_IA_URL` | Oui | URL interne de NolCore-IA |
+| `NOLCORE_CRAWLER_URL` | Oui | URL interne de NolCore-Crawler |
+| `NOLCORE_DEFAULT_PROVIDER` | Non | Fournisseur de conversation par défaut |
+| `NOLCORE_DEFAULT_MODEL` | Non | Modèle de conversation par défaut |
+| `NOLCORE_VERIFICATION_SMTP_ID` | Non | Profil SMTP utilisé pour la vérification |
+| `NOLCORE_PUBLIC_URL` | Non | Base URL dans les e-mails de vérification |
+| `NOLCORE_DISCORD_*` | Non | Bot, guild et webhook Discord |
+
+Les tokens Claude, ChatGPT, Mistral et Gemini sont configurés uniquement dans
+[NolCore-IA](https://github.com/Noliae-France/NolCore-IA).
 
 ## API v1
 
-### Utilisateur
+| Groupe | Endpoints |
+|---|---|
+| Santé | `GET /api/health`, `/api/ready`, `/api/dependencies` |
+| Auth | `POST /v1/user/register`, `/login`; `GET /v1/user/me`, `/verify` |
+| Compte | `POST /v1/user/resetpassword`, `/me/changepassword`, `/me/changemail`, `/me/changename` |
+| IA | `POST /v1/ia`, `POST /v1/ia/:nameid/:modelia/:text` |
+| Recherche | `GET /v1/search/text/:keyword`, `/img/:keyword`, `/ia/:keyword` |
+| Crawler | `POST /v1/crawler/visite/:url`, `GET /v1/crawler/result/:url` |
+| Permissions | `GET /v1/perms` |
+| Administration | `GET /v1/admin/user/`, `/ia/`, `/smtp/`, `/crawler/`, `/discord/` |
+| SMTP | `POST /v1/smtp/:idsmtp/send`, `GET /pool`, `DELETE /remove` |
+| Discord | `GET /v1/discord/bot`, `POST /v1/discord/webhook` |
 
-```text
-POST /v1/user/register
-POST /v1/user/login
-GET  /v1/user/me
-POST /v1/user/resetpassword
-POST /v1/user/me/changepassword
-POST /v1/user/me/changemail
-POST /v1/user/me/changename
-```
+Les routes protégées acceptent le Bearer token renvoyé par le login ou le
+cookie `nol_session`. Les routes de recherche sont limitées en débit.
 
-La connexion renvoie un Bearer token et pose le cookie `nol_session`. Le cookie
-est valable 24 heures et est invalidé en cas de changement d’IP ou d’email.
+## SMTP
 
-### IA multi-fournisseurs
+Les identifiants SMTP ne sont jamais stockés en base : le profil pointe vers
+une variable d’environnement `secret_env`. Seuls les ports suivants sont
+acceptés :
 
-```text
-POST /v1/ia/:nameid/:modelia/:text
-POST /v1/ia
-```
+- `465` : SMTPS implicite ;
+- `587` : STARTTLS obligatoire.
 
-Variables de configuration :
+## Kubernetes / K3s
 
-```env
-NOLCORE_CLAUDE_URL=https://...
-NOLCORE_CLAUDE_TOKEN=...
-NOLCORE_CHATGPT_URL=https://...
-NOLCORE_CHATGPT_TOKEN=...
-NOLCORE_MISTRAL_URL=https://...
-NOLCORE_MISTRAL_TOKEN=...
-NOLCORE_GEMINI_URL=https://...
-NOLCORE_GEMINI_TOKEN=...
-```
-
-### Recherche et crawler
-
-```text
-GET  /v1/search/text/:keyword
-GET  /v1/search/img/:keyword
-GET  /v1/search/ia/:keyword
-POST /v1/crawler/visite/:url
-GET  /v1/crawler/result/:url
-```
-
-Le crawler est exécuté par
-[NolCore-Crawler](https://github.com/Noliae-France/NolCore-Crawler), qui
-applique `robots.txt`. L’API conserve les résultats indexés dans PostgreSQL.
-
-### Permissions, administration et Discord
-
-```text
-GET  /v1/perms
-GET  /v1/admin/
-POST /v1/smtp/:idsmtp/send
-GET  /v1/smtp/:idsmtp/pool
-DELETE /v1/smtp/:idsmtp/remove
-GET  /v1/admin/user/
-GET  /v1/admin/ia/
-GET  /v1/admin/smtp/
-GET  /v1/admin/crawler/
-GET  /v1/admin/discord/
-GET  /v1/discord/bot
-POST /v1/discord/webhook
-```
-
-Configuration Discord : `NOLCORE_DISCORD_BOT_TOKEN`,
-`NOLCORE_DISCORD_GUILD_ID` et `NOLCORE_DISCORD_WEBHOOK_URL`.
-
-Les profils SMTP sont obligatoirement chiffrés : `465` utilise SMTPS implicite
-et `587` utilise STARTTLS. Tout autre port est refusé par le worker SMTP.
-Le mot de passe reste dans l’environnement indiqué par `secret_env` ; il n’est
-jamais stocké dans PostgreSQL.
-
-## Développement
-
-Le workflow GitHub Actions compile l’image Docker avec le binaire Nolc public,
-exécute un smoke test HTTP, démarre PostgreSQL, vérifie le schéma, puis teste
-l’inscription, la connexion Bearer et la session cookie.
+`deploy/k8s/base` déploie l’API et PostgreSQL. Renseignez les noms DNS internes
+des services IA et crawler dans `NOLCORE_IA_URL` et `NOLCORE_CRAWLER_URL`.
 
 ```sh
-# Avec le compilateur Nolc installé
+kubectl -n nolcore create secret generic nolcore-secrets \
+  --from-literal=postgres-password='mot-de-passe-fort' \
+  --from-literal=session-secret="$(openssl rand -hex 32)"
+kubectl apply -k deploy/k8s/base
+```
+
+## Développement et qualité
+
+```sh
 nolc check main.nol
 ```
 
-## Sécurité
+La CI construit l’image Docker et effectue un smoke test. L’intégration complète
+API + IA + Crawler est vérifiée dans le dépôt
+[NolCore](https://github.com/Noliae-France/NolCore).
 
-- Les secrets sont lus depuis l’environnement.
-- Les mots de passe sont hachés avec Argon2id via libsodium.
-- Les requêtes SQL sont paramétrées.
-- Les cookies de session sont `HttpOnly`, `SameSite=Lax` et peuvent être `Secure`.
-- Les recherches sont limitées et auditées.
-- Les robots sont respectés avant toute visite.
+## Sécurité et licence
 
-NolCore est une base open source en évolution. Les règles de déploiement,
-rotation de secrets, sauvegardes PostgreSQL, TLS, MFA et observabilité doivent
-être définies pour chaque environnement de production.
+- Mots de passe hachés avec Argon2id/libsodium.
+- SQL paramétré via libpq.
+- Cookies `HttpOnly`, `SameSite=Lax` et `Secure` si configuré.
+- Secrets injectés par environnement ou gestionnaire de secrets.
 
-## Licence
-
-Voir [LICENSE](LICENSE).
-
-## Documentation du projet
-
-- [Politique de sécurité](SECURITY.md)
-- [Guide de contribution](CONTRIBUTING.md)
-- [Code de conduite](CODE_OF_CONDUCT.md)
-- [Journal des changements](CHANGELOG.md)
+Voir [SECURITY.md](SECURITY.md), [CONTRIBUTING.md](CONTRIBUTING.md) et la
+[licence MIT](LICENSE).
