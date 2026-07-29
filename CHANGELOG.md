@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Documentation : NolCore est désigné comme dépôt canonique pendant la
+  migration de cette séparation API.
 - Documentation sécurité, contribution et déploiement communautaire.
 - Compatibilité Kubernetes/K3s via Kustomize.
 - Vérification de compte par e-mail avec Postfix/Dovecot dans la CI.

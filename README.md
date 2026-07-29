@@ -11,6 +11,12 @@
 
 </div>
 
+> **Statut de dépôt — migration.** Le dépôt canonique et publié pour NolCore
+> est [NolCore](https://github.com/Noliae-France/NolCore). Cette séparation API
+> est conservée pour la migration microservices et ne doit pas être déployée à
+> la place du Core canonique tant que les contrats Auth, sessions et CI n’ont
+> pas été synchronisés.
+
 ## Rôle du service
 
 NolCore-API est l’API publique et la source de vérité métier : comptes,
