@@ -2,7 +2,6 @@ name: NolCore CI
 on: [push, pull_request]
 permissions:
   contents: read
-  packages: read
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -18,7 +17,6 @@ jobs:
       - name: Smoke test HTTP server
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GHCR_TOKEN: ${{ github.token }}
         run: |
           set -e
           test "$(sha256sum schema.sql | cut -d' ' -f1)" = "$(sha256sum deploy/k8s/base/schema.sql | cut -d' ' -f1)"
@@ -36,15 +34,15 @@ jobs:
           docker exec nolcore-postfix sh -c "printf 'QUIT\\r\\n' | openssl s_client -connect smtp-test:465 -servername smtp-test -CAfile /certs/ca.crt -quiet 2>/dev/null | head -1 | grep -E '^220'"
           for i in $(seq 1 30); do docker exec nolcore-db pg_isready -U nolcore -d nolcore && break || sleep 1; done
           docker exec nolcore-db psql -U nolcore -d nolcore -c "INSERT INTO smtp_profiles(id,host,port,username,secret_env) VALUES('ci-verify','smtp-test',465,'','CI_SMTP_PASSWORD')"
-          # L'agrégateur reste interne. Le test fournisseur est exécuté
-          # seulement lorsqu'un secret OpenAI est disponible (jamais sur les
-          # pull requests externes) et la clé ne figure ni dans la sortie ni
-          # dans l'image.
+          # L'agrégateur est construit depuis son dépôt public plutôt que
+          # tiré de GHCR : les permissions de packages GitHub sont isolées par
+          # dépôt. Le test reste ainsi autonome et reproductible.
           if test -n "$OPENAI_API_KEY"; then
-            printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+            git clone --depth 1 https://github.com/Noliae-France/NolCore-IA.git /tmp/nolcore-ia-src
+            docker build -t nolcore-ia:ci /tmp/nolcore-ia-src
             docker run -d --rm --name nolcore-ia --network nolcore-ci \
               -e NOLCORE_CHATGPT_TOKEN="$OPENAI_API_KEY" \
-              ghcr.io/noliae-france/nolcore-ia:main
+              nolcore-ia:ci
             for i in $(seq 1 20); do docker exec nolcore-ia sh -c 'true' >/dev/null 2>&1 && break || sleep 1; done
           fi
           docker run -d --rm --name nolcore-smoke --network nolcore-ci -p 8080:8080 \
