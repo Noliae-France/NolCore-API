@@ -75,8 +75,8 @@ jobs:
           if test -n "$OPENAI_API_KEY"; then
             curl -fsS -X POST http://127.0.0.1:8080/v1/ia \
               -H 'Content-Type: application/json' -b /tmp/cookies.txt \
-              -d '{"provider":"chatgpt","model":"gpt-4o-mini","text":"Réponds uniquement OK."}' \
-              | jq -e '.provider == "chatgpt" and (.result | type == "string")'
+              -d '{"message":"Réponds uniquement OK."}' \
+              | jq -e '.answer | type == "string"'
           fi
           curl -fsS -X POST http://127.0.0.1:8080/v1/user/me/changepassword \
             -H 'Content-Type: application/json' -b /tmp/cookies.txt \
