@@ -1,5 +1,8 @@
 name: NolCore CI
 on: [push, pull_request]
+permissions:
+  contents: read
+  packages: read
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -15,6 +18,7 @@ jobs:
       - name: Smoke test HTTP server
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GHCR_TOKEN: ${{ github.token }}
         run: |
           set -e
           test "$(sha256sum schema.sql | cut -d' ' -f1)" = "$(sha256sum deploy/k8s/base/schema.sql | cut -d' ' -f1)"
@@ -37,6 +41,7 @@ jobs:
           # pull requests externes) et la clé ne figure ni dans la sortie ni
           # dans l'image.
           if test -n "$OPENAI_API_KEY"; then
+            printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
             docker run -d --rm --name nolcore-ia --network nolcore-ci \
               -e NOLCORE_CHATGPT_TOKEN="$OPENAI_API_KEY" \
               ghcr.io/noliae-france/nolcore-ia:main
