@@ -17,6 +17,10 @@
 > la place du Core canonique tant que les contrats Auth, sessions et CI n’ont
 > pas été synchronisés.
 
+Pour les frontends et le déploiement, suivez la documentation du dépôt
+[NolCore](https://github.com/Noliae-France/NolCore), qui centralise les
+contrats actuellement publiés.
+
 ## Rôle du service
 
 NolCore-API est l’API publique et la source de vérité métier : comptes,
