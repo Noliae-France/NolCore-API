@@ -13,6 +13,8 @@ jobs:
           tags: nolcore:ci
           load: true
       - name: Smoke test HTTP server
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           set -e
           test "$(sha256sum schema.sql | cut -d' ' -f1)" = "$(sha256sum deploy/k8s/base/schema.sql | cut -d' ' -f1)"
@@ -30,6 +32,16 @@ jobs:
           docker exec nolcore-postfix sh -c "printf 'QUIT\\r\\n' | openssl s_client -connect smtp-test:465 -servername smtp-test -CAfile /certs/ca.crt -quiet 2>/dev/null | head -1 | grep -E '^220'"
           for i in $(seq 1 30); do docker exec nolcore-db pg_isready -U nolcore -d nolcore && break || sleep 1; done
           docker exec nolcore-db psql -U nolcore -d nolcore -c "INSERT INTO smtp_profiles(id,host,port,username,secret_env) VALUES('ci-verify','smtp-test',465,'','CI_SMTP_PASSWORD')"
+          # L'agrégateur reste interne. Le test fournisseur est exécuté
+          # seulement lorsqu'un secret OpenAI est disponible (jamais sur les
+          # pull requests externes) et la clé ne figure ni dans la sortie ni
+          # dans l'image.
+          if test -n "$OPENAI_API_KEY"; then
+            docker run -d --rm --name nolcore-ia --network nolcore-ci \
+              -e NOLCORE_CHATGPT_TOKEN="$OPENAI_API_KEY" \
+              ghcr.io/noliae-france/nolcore-ia:main
+            for i in $(seq 1 20); do docker exec nolcore-ia sh -c 'true' >/dev/null 2>&1 && break || sleep 1; done
+          fi
           docker run -d --rm --name nolcore-smoke --network nolcore-ci -p 8080:8080 \
             -e NOLIAE_SESSION_SECRET=ci-secret-0123456789-0123456789-0123 \
             -e NOLCORE_SMTP_CI_SMTP_465_FROM=nolcore@smtp-test \
@@ -38,6 +50,7 @@ jobs:
             -e NOLCORE_VERIFICATION_SMTP_ID=ci-verify \
             -e NOLCORE_VERIFICATION_FROM=nolcore@smtp-test \
             -e NOLCORE_PUBLIC_URL=http://127.0.0.1:8080 \
+            -e NOLCORE_IA_URL=http://nolcore-ia:8092 \
             -v /tmp/nolcore-smtp-certs:/certs:ro \
             -e NOLCORE_DATABASE_URL=postgres://nolcore:ci_password@nolcore-db:5432/nolcore nolcore:ci
           for i in $(seq 1 20); do curl -fsS http://127.0.0.1:8080/api/health >/dev/null 2>&1 && break || sleep 1; done
@@ -56,6 +69,12 @@ jobs:
           test "$TOKEN" != "null" && test -n "$TOKEN"
           curl -fsS http://127.0.0.1:8080/v1/user/me -H "Authorization: Bearer $TOKEN" | jq -e '.email == "ci@example.test"'
           curl -fsS http://127.0.0.1:8080/v1/user/me -b /tmp/cookies.txt | jq -e '.email == "ci@example.test"'
+          if test -n "$OPENAI_API_KEY"; then
+            curl -fsS -X POST http://127.0.0.1:8080/v1/ia \
+              -H 'Content-Type: application/json' -b /tmp/cookies.txt \
+              -d '{"provider":"chatgpt","model":"gpt-4o-mini","text":"Réponds uniquement OK."}' \
+              | jq -e '.provider == "chatgpt" and (.result | type == "string")'
+          fi
           curl -fsS -X POST http://127.0.0.1:8080/v1/user/me/changepassword \
             -H 'Content-Type: application/json' -b /tmp/cookies.txt \
             -d '{"password":"ci-password-456"}' | jq -e '.updated == true'
@@ -88,6 +107,7 @@ jobs:
             -d '{"title":"CI hello","content":"hello NolCore search"}' | jq -e '.id != null'
           curl -fsS http://127.0.0.1:8080/v1/search/text/hello -b /tmp/new-cookies.txt | jq -e 'length >= 1'
           docker stop nolcore-smoke
+          if test -n "$OPENAI_API_KEY"; then docker stop nolcore-ia; fi
           docker stop nolcore-postfix
           docker rm nolcore-postfix
           docker stop nolcore-db
